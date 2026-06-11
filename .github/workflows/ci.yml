@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libibverbs-dev ibverbs-providers \
+            rdma-core iproute2 python3-numpy
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+      - name: Tests (TCP transport)
+        run: |
+          VCCL_TRANSPORT=tcp ctest --test-dir build --output-on-failure
+      - name: Set up Soft-RoCE (rxe)
+        id: rxe
+        continue-on-error: true
+        run: |
+          sudo modprobe rdma_rxe || { echo "rdma_rxe unavailable"; exit 1; }
+          IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+          sudo rdma link add rxe0 type rxe netdev "$IFACE"
+          rdma link
+      - name: Tests (verbs transport over Soft-RoCE)
+        if: steps.rxe.outcome == 'success'
+        run: |
+          VCCL_TRANSPORT=verbs ctest --test-dir build --output-on-failure
+      - name: Python binding tests
+        run: |
+          VCCL_LIBRARY="$PWD/build/libvccl.so" python3 python/tests/test_bindings.py
+      - name: Python binding tests (verbs)
+        if: steps.rxe.outcome == 'success'
+        run: |
+          VCCL_LIBRARY="$PWD/build/libvccl.so" VCCL_TRANSPORT=verbs \
+            python3 python/tests/test_bindings.py
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: Tests (TCP transport)
+        run: ctest --test-dir build --output-on-failure
+      - name: Python binding tests
+        run: |
+          VCCL_LIBRARY="$PWD/build/libvccl.dylib" python3 python/tests/test_bindings.py
