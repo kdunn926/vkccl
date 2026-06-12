@@ -115,6 +115,14 @@ vcclResult_t getAdvertisedAddr(SocketAddr* addr) {
 static void setSockOpts(int fd) {
   int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#ifdef SO_NOSIGPIPE
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+  // Large socket buffers: ring steps move multi-megabyte chunks and the
+  // kernel default is far below the bandwidth-delay product of a busy link.
+  int bufBytes = 1 << 22;
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufBytes, sizeof(bufBytes));
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufBytes, sizeof(bufBytes));
 }
 
 vcclResult_t createListenSocket(int* fd, uint16_t port, uint16_t* boundPort) {
@@ -197,7 +205,7 @@ vcclResult_t sendAll(int fd, const void* buf, size_t bytes) {
   const char* p = static_cast<const char*>(buf);
   size_t sent = 0;
   while (sent < bytes) {
-    ssize_t n = send(fd, p + sent, bytes - sent, 0);
+    ssize_t n = send(fd, p + sent, bytes - sent, kSendFlags);
     if (n > 0) {
       sent += static_cast<size_t>(n);
       continue;
@@ -271,7 +279,7 @@ vcclResult_t duplexTransfer(int sendFd, const void* sbuf, size_t sbytes,
       return vcclSystemError;
     }
     if (sendIdx >= 0 && (pfds[sendIdx].revents & (POLLOUT | POLLERR | POLLHUP))) {
-      ssize_t k = send(sendFd, sp + sent, sbytes - sent, 0);
+      ssize_t k = send(sendFd, sp + sent, sbytes - sent, kSendFlags);
       if (k > 0) {
         sent += static_cast<size_t>(k);
       } else if (k < 0 && errno != EINTR && errno != EAGAIN &&

@@ -23,6 +23,10 @@ LogLevel logLevel() {
   return level;
 }
 
+namespace {
+thread_local char t_lastError[1024] = "";
+}
+
 void logMsg(LogLevel level, const char* fmt, ...) {
   static const char* names[] = {"NONE", "ERROR", "WARN", "INFO", "TRACE"};
   char buf[1024];
@@ -30,8 +34,13 @@ void logMsg(LogLevel level, const char* fmt, ...) {
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
+  if (level == LogLevel::kError) {
+    snprintf(t_lastError, sizeof(t_lastError), "%s", buf);
+  }
   fprintf(stderr, "vccl [%d] %s: %s\n", static_cast<int>(getpid()),
           names[static_cast<int>(level)], buf);
 }
+
+const char* lastErrorString() { return t_lastError; }
 
 }  // namespace vccl

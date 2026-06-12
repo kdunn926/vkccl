@@ -5,10 +5,17 @@
  * One RC queue pair per peer, connected eagerly at communicator init; QP
  * parameters are exchanged through the bootstrap network. Data moves with
  * two-sided send/recv: the receiver pre-posts before the sender posts, and
- * RNR retries absorb any remaining race. Memory regions are registered on
- * first use and cached by exact (address, length); on unified-memory APUs
- * this path is already zero-copy for GPU data, since mapped device-local
- * Vulkan allocations are ordinary host pages.
+ * RNR retries absorb any remaining race.
+ *
+ * Memory registration: persistent MRs come from vcclCommRegister /
+ * vcclCommRegisterDmaBuf and from the per-collective ScopedReg done in the
+ * collectives layer; anything else gets a temporary MR released when its
+ * work completes. On-demand MRs are deliberately NOT cached across calls: a
+ * freed allocation's virtual range can be remapped to new physical pages,
+ * and a cached MR would keep the NIC pointed at the old ones. Sends small
+ * enough for IBV_SEND_INLINE skip registration entirely. On unified-memory
+ * APUs this path is already zero-copy for GPU data, since mapped
+ * device-local Vulkan allocations are ordinary host pages.
  *
  * Env knobs:
  *   VCCL_IB_HCA       device name (default: first device with an active port)
@@ -23,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <map>
 #include <memory>
 #include <random>
@@ -39,6 +47,9 @@ namespace {
 
 constexpr size_t kMaxSegBytes = 1ull << 30;
 constexpr int kQueueDepth = 128;
+// Inline-send threshold to request at QP creation: payloads this small ride
+// inside the WQE (lower latency, no memory registration involved).
+constexpr uint32_t kWantInline = 220;
 
 struct QpInfo {
   uint32_t qpn;
@@ -196,6 +207,7 @@ class VerbsTransport final : public Transport {
     const int nranks = bs->nranks();
     t->cqs_.assign(nranks, nullptr);
     t->qps_.assign(nranks, nullptr);
+    t->maxInline_.assign(nranks, 0);
 
     std::mt19937 rng(std::random_device{}());
     std::vector<QpInfo> local(nranks);
@@ -235,9 +247,9 @@ class VerbsTransport final : public Transport {
       VCCL_ERR("ibv_reg_mr(%p, %zu) failed: %s", buf, bytes, strerror(errno));
       return vcclSystemError;
     }
-    uintptr_t start = reinterpret_cast<uintptr_t>(buf);
-    regions_[start] = Region{bytes, mr, nullptr};
-    *handle = new uintptr_t(start);
+    regions_.push_back(
+        Region{reinterpret_cast<uintptr_t>(buf), bytes, mr, nullptr});
+    *handle = &regions_.back();
     return vcclSuccess;
   }
 
@@ -254,8 +266,8 @@ class VerbsTransport final : public Transport {
                           IBV_ACCESS_LOCAL_WRITE);
     if (mr != nullptr) {
       VCCL_INFO("dmabuf MR registered (fd %d, %zu bytes)", fd, bytes);
-      regions_[start] = Region{bytes, mr, nullptr};
-      *handle = new uintptr_t(start);
+      regions_.push_back(Region{start, bytes, mr, nullptr});
+      *handle = &regions_.back();
       return vcclSuccess;
     }
     // No provider dmabuf support (e.g. rxe). The CPU mapping of a dmabuf
@@ -273,28 +285,37 @@ class VerbsTransport final : public Transport {
         "ibv_reg_dmabuf_mr unsupported (%s); staging dmabuf region through "
         "a bounce buffer",
         strerror(errno));
-    regions_[start] = Region{bytes, smr, staging};
-    *handle = new uintptr_t(start);
+    regions_.push_back(Region{start, bytes, smr, staging});
+    *handle = &regions_.back();
     return vcclSuccess;
   }
 
   vcclResult_t deregMr(void* handle) override {
     if (handle == nullptr) return vcclSuccess;
-    auto* start = static_cast<uintptr_t*>(handle);
-    auto it = regions_.find(*start);
-    if (it != regions_.end()) {
-      ibv_dereg_mr(it->second.mr);
-      free(it->second.staging);
-      regions_.erase(it);
+    for (auto it = regions_.begin(); it != regions_.end(); ++it) {
+      if (&*it == handle) {
+        ibv_dereg_mr(it->mr);
+        free(it->staging);
+        regions_.erase(it);
+        return vcclSuccess;
+      }
     }
-    delete start;
-    return vcclSuccess;
+    return vcclInvalidArgument;
+  }
+
+  bool covers(const void* buf, size_t bytes) const override {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(buf);
+    for (const Region& region : regions_) {
+      if (addr >= region.start && addr + bytes <= region.start + region.len)
+        return true;
+    }
+    return false;
   }
 
   ~VerbsTransport() override {
-    for (auto& kv : regions_) {
-      ibv_dereg_mr(kv.second.mr);
-      free(kv.second.staging);
+    for (auto& region : regions_) {
+      ibv_dereg_mr(region.mr);
+      free(region.staging);
     }
     for (ibv_qp* qp : qps_)
       if (qp != nullptr) ibv_destroy_qp(qp);
@@ -316,7 +337,7 @@ class VerbsTransport final : public Transport {
     int wrs = 0;
     VCCLCHECK(postRecv(peer, buf, bytes, &wrs));
     VCCLCHECK(pollPeer(peer, 0, wrs));
-    drainCopybacks();
+    drainCompleted();
     return vcclSuccess;
   }
 
@@ -342,7 +363,72 @@ class VerbsTransport final : public Transport {
         }
       }
     }
-    drainCopybacks();
+    drainCompleted();
+    return vcclSuccess;
+  }
+
+  vcclResult_t batch(const std::vector<P2pOp>& ops) override {
+    // Post in waves so no QP exceeds its work-queue depth, polling each
+    // wave to completion. Within a wave, all transfers progress together
+    // (RC QPs are independent; send/recv on one QP are independent queues).
+    size_t idx = 0;
+    while (idx < ops.size()) {
+      std::map<int, std::pair<int, int>> waveWrs;  // peer -> (send, recv)
+      std::map<int, std::pair<int, int>> posted;
+      size_t waveEnd = idx;
+      for (; waveEnd < ops.size(); waveEnd++) {
+        const P2pOp& op = ops[waveEnd];
+        if (op.bytes == 0) continue;
+        int needed =
+            static_cast<int>((op.bytes + kMaxSegBytes - 1) / kMaxSegBytes);
+        auto& counts = waveWrs[op.peer];
+        int& dirCount = op.isSend ? counts.first : counts.second;
+        if (dirCount + needed > kQueueDepth) break;
+        dirCount += needed;
+      }
+      if (waveEnd == idx) {  // single oversized op: segments fit by design
+        waveEnd = idx + 1;
+      }
+      for (size_t i = idx; i < waveEnd; i++) {
+        const P2pOp& op = ops[i];
+        if (op.bytes == 0) continue;
+        int wrs = 0;
+        if (op.isSend) {
+          VCCLCHECK(postSend(op.peer, op.buf, op.bytes, &wrs));
+          posted[op.peer].first += wrs;
+        } else {
+          VCCLCHECK(postRecv(op.peer, op.buf, op.bytes, &wrs));
+          posted[op.peer].second += wrs;
+        }
+      }
+      Deadline deadline;
+      bool pending = true;
+      std::map<int, std::pair<int, int>> done;
+      while (pending) {
+        pending = false;
+        for (auto& entry : posted) {
+          auto& d = done[entry.first];
+          if (d.first < entry.second.first ||
+              d.second < entry.second.second) {
+            VCCLCHECK(pollOnce(entry.first, &d.first, &d.second));
+            if (d.first < entry.second.first ||
+                d.second < entry.second.second) {
+              pending = true;
+            }
+          }
+        }
+        if (isAborted()) {
+          VCCL_ERR("batch aborted");
+          return vcclSystemError;
+        }
+        if (pending && deadline.expired()) {
+          VCCL_ERR("batch completion wait timed out (VCCL_TIMEOUT)");
+          return vcclSystemError;
+        }
+      }
+      drainCompleted();
+      idx = waveEnd;
+    }
     return vcclSuccess;
   }
 
@@ -353,6 +439,7 @@ class VerbsTransport final : public Transport {
   // only ever touches `staging`, and the data path copies to/from the real
   // buffer around each transfer.
   struct Region {
+    uintptr_t start = 0;
     size_t len = 0;
     ibv_mr* mr = nullptr;
     char* staging = nullptr;
@@ -386,12 +473,19 @@ class VerbsTransport final : public Transport {
     attr.cap.max_recv_wr = kQueueDepth;
     attr.cap.max_send_sge = 1;
     attr.cap.max_recv_sge = 1;
+    attr.cap.max_inline_data = kWantInline;
     ibv_qp* qp = ibv_create_qp(dev_.pd, &attr);
+    if (qp == nullptr) {
+      // Provider may not support the requested inline size; retry without.
+      attr.cap.max_inline_data = 0;
+      qp = ibv_create_qp(dev_.pd, &attr);
+    }
     if (qp == nullptr) {
       VCCL_ERR("ibv_create_qp failed");
       return vcclSystemError;
     }
     qps_[peer] = qp;
+    maxInline_[peer] = attr.cap.max_inline_data;
 
     ibv_qp_attr qpa{};
     qpa.qp_state = IBV_QPS_INIT;
@@ -455,19 +549,18 @@ class VerbsTransport final : public Transport {
 
   // Resolve [buf, buf+bytes) to its MR and the address the NIC should use.
   // For bounce (staging) regions the NIC address lives in the staging copy.
+  // Ranges with no covering registration get a temporary MR, deregistered
+  // once the posted work completes (see drainTempMrs) — caching it would go
+  // stale when the allocation is freed and its pages returned to the kernel.
   vcclResult_t resolve(const void* buf, size_t bytes, Resolved* out) {
     uintptr_t addr = reinterpret_cast<uintptr_t>(buf);
-    auto it = regions_.upper_bound(addr);
-    if (it != regions_.begin()) {
-      --it;
-      uintptr_t start = it->first;
-      const Region& region = it->second;
-      if (addr >= start && addr + bytes <= start + region.len) {
+    for (const Region& region : regions_) {
+      if (addr >= region.start && addr + bytes <= region.start + region.len) {
         out->mr = region.mr;
-        out->nicAddr =
-            region.staging != nullptr
-                ? reinterpret_cast<uintptr_t>(region.staging) + (addr - start)
-                : addr;
+        out->nicAddr = region.staging != nullptr
+                           ? reinterpret_cast<uintptr_t>(region.staging) +
+                                 (addr - region.start)
+                           : addr;
         out->bounced = region.staging != nullptr;
         return vcclSuccess;
       }
@@ -478,7 +571,7 @@ class VerbsTransport final : public Transport {
       VCCL_ERR("ibv_reg_mr(%p, %zu) failed: %s", buf, bytes, strerror(errno));
       return vcclSystemError;
     }
-    regions_[addr] = Region{bytes, mr, nullptr};
+    tempMrs_.push_back(mr);
     out->mr = mr;
     out->nicAddr = addr;
     out->bounced = false;
@@ -486,6 +579,24 @@ class VerbsTransport final : public Transport {
   }
 
   vcclResult_t postSend(int peer, const void* buf, size_t bytes, int* wrs) {
+    if (bytes <= maxInline_[peer]) {
+      // Inline: the CPU copies the payload into the WQE; no MR, and the
+      // buffer (even a dmabuf mapping) is reusable immediately.
+      ibv_sge sge{};
+      sge.addr = reinterpret_cast<uintptr_t>(buf);
+      sge.length = static_cast<uint32_t>(bytes);
+      ibv_send_wr wr{}, *bad = nullptr;
+      wr.sg_list = &sge;
+      wr.num_sge = 1;
+      wr.opcode = IBV_WR_SEND;
+      wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+      if (ibv_post_send(qps_[peer], &wr, &bad) != 0) {
+        VCCL_ERR("ibv_post_send(inline) failed: %s", strerror(errno));
+        return vcclSystemError;
+      }
+      (*wrs)++;
+      return vcclSuccess;
+    }
     Resolved r;
     VCCLCHECK(resolve(buf, bytes, &r));
     if (r.bounced) {
@@ -537,10 +648,14 @@ class VerbsTransport final : public Transport {
     return vcclSuccess;
   }
 
-  void drainCopybacks() {
+  // Run after every completion wait: flush staged receives back to their
+  // dmabuf mappings, and release temporary MRs whose work has finished.
+  void drainCompleted() {
     for (const Copyback& cb : pendingCopyback_)
       memcpy(cb.dst, cb.src, cb.bytes);
     pendingCopyback_.clear();
+    for (ibv_mr* mr : tempMrs_) ibv_dereg_mr(mr);
+    tempMrs_.clear();
   }
 
   vcclResult_t pollOnce(int peer, int* sendDone, int* recvDone) {
@@ -570,6 +685,10 @@ class VerbsTransport final : public Transport {
     int sendDone = 0, recvDone = 0;
     while (sendDone < sendWrs || recvDone < recvWrs) {
       VCCLCHECK(pollOnce(peer, &sendDone, &recvDone));
+      if (isAborted()) {
+        VCCL_ERR("operation aborted (peer %d)", peer);
+        return vcclSystemError;
+      }
       if (deadline.expired()) {
         VCCL_ERR("completion wait timed out (peer %d, VCCL_TIMEOUT)", peer);
         return vcclSystemError;
@@ -581,10 +700,13 @@ class VerbsTransport final : public Transport {
   Device dev_;
   std::vector<ibv_cq*> cqs_;
   std::vector<ibv_qp*> qps_;
-  // All registered ranges (user registrations and the on-demand cache),
-  // keyed by start address.
-  std::map<uintptr_t, Region> regions_;
+  std::vector<uint32_t> maxInline_;
+  // Persistent registrations (vcclCommRegister / dmabuf imports). std::list:
+  // Region addresses are handed out as handles and must stay stable.
+  std::list<Region> regions_;
   std::vector<Copyback> pendingCopyback_;
+  // MRs created on the fly for unregistered ranges, freed by drainCompleted.
+  std::vector<ibv_mr*> tempMrs_;
 };
 
 }  // namespace

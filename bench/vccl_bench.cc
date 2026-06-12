@@ -289,15 +289,21 @@ int main(int argc, char** argv) {
   const char* rankEnv = getenv("VCCL_RANK");
   const char* nranksEnv = getenv("VCCL_NRANKS");
   const char* idFile = getenv("VCCL_ID_FILE");
-  if (rankEnv == nullptr || nranksEnv == nullptr || idFile == nullptr) {
+  const char* commId = getenv("VCCL_COMM_ID");
+  if (rankEnv == nullptr || nranksEnv == nullptr ||
+      (idFile == nullptr && commId == nullptr)) {
     fprintf(stderr,
-            "set VCCL_RANK, VCCL_NRANKS and VCCL_ID_FILE, or use --launch N\n");
+            "set VCCL_RANK, VCCL_NRANKS and either VCCL_COMM_ID=<ip:port of "
+            "rank 0> or VCCL_ID_FILE=<shared path>, or use --launch N\n");
     return 2;
   }
   int rank = atoi(rankEnv);
   int nranks = atoi(nranksEnv);
   vcclUniqueId id;
-  if (rank == 0) {
+  if (commId != nullptr) {
+    // Deterministic id on every rank; no out-of-band exchange needed.
+    if (vcclGetUniqueId(&id) != vcclSuccess) return 1;
+  } else if (rank == 0) {
     if (vcclGetUniqueId(&id) != vcclSuccess) return 1;
     if (!writeIdFile(idFile, id)) {
       fprintf(stderr, "cannot write id file %s\n", idFile);

@@ -1,7 +1,13 @@
 build/
+build-kit/
 *.o
 *.so
 *.dylib
 *.a
 compile_commands.json
 .cache/
+__pycache__/
+
+# kit/dist contains intentionally-committed static release binaries;
+# exempt them from the generic ignore rules above.
+!kit/dist/*

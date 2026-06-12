@@ -1,0 +1,50 @@
+diff --git a/vllm_vulkan/platform.py b/vllm_vulkan/platform.py
+index f205f54..9f0626e 100644
+--- a/vllm_vulkan/platform.py
++++ b/vllm_vulkan/platform.py
+@@ -68,6 +68,28 @@ class VulkanPlatform(Platform):
+     device_name: str = "cpu"
+     device_type: str = "cpu"
+     dispatch_key: str = "CPU"
++    # torch.distributed bootstrap backend; the data plane goes through the
++    # device communicator below when vccl is installed.
++    dist_backend: str = "gloo"
++
++    @classmethod
++    def get_device_communicator_cls(cls) -> str:
++        """Use vccl (RDMA/RoCE collectives for Vulkan nodes) when present.
++
++        Tensors in this backend live in host memory, which is exactly what
++        vccl operates on; on unified-memory APUs (e.g. BC-250) that already
++        covers GPU-visible data. Falls back to vLLM's gloo-based base
++        communicator when vccl is not installed.
++        """
++        try:
++            import vccl  # noqa: F401
++
++            return "vccl.torch_comm.VcclCommunicator"
++        except ImportError:
++            logger.info("vccl not installed; using base device communicator")
++            from vllm.platforms.interface import Platform as _P
++
++            return _P.get_device_communicator_cls()
+ 
+     # ─── Device queries ──────────────────────────────────────────────────────
+ 
+@@ -180,7 +202,15 @@ class VulkanPlatform(Platform):
+             parallel_config.worker_cls = "vllm_vulkan.worker.VulkanWorker"
+ 
+         if parallel_config.distributed_executor_backend in ("auto", None):
+-            parallel_config.distributed_executor_backend = "uni"
++            # Single-process for the common world_size == 1 case. For
++            # multi-node tensor parallelism (one Vulkan device per node,
++            # launched with --distributed-executor-backend external_launcher
++            # or mp), keep whatever the user selected; collectives then run
++            # through vccl (RoCE v2 RDMA with TCP fallback) when available.
++            if parallel_config.world_size == 1:
++                parallel_config.distributed_executor_backend = "uni"
++            else:
++                parallel_config.distributed_executor_backend = "mp"
+ 
+         parallel_config.disable_custom_all_reduce = True
+ 

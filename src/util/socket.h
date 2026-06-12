@@ -12,6 +12,15 @@
 
 namespace vccl {
 
+// send() flags for data sockets: a dead peer must surface as an error from
+// the call, not a process-killing SIGPIPE. macOS has no MSG_NOSIGNAL; there
+// SO_NOSIGPIPE is set on every socket instead (see setSockOpts).
+#ifdef MSG_NOSIGNAL
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kSendFlags = 0;
+#endif
+
 // A self-contained socket address (IPv4 or IPv6).
 struct SocketAddr {
   sockaddr_storage storage{};

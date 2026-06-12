@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "core/bootstrap.h"
 
+#include <arpa/inet.h>
+
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -66,6 +68,37 @@ vcclResult_t uniqueIdCreate(vcclUniqueId* out) {
   memset(out->internal, 0, VCCL_UNIQUE_ID_BYTES);
   auto* id = reinterpret_cast<UniqueIdInternal*>(out->internal);
 
+  // VCCL_COMM_ID=<ip>:<port> (NCCL_COMM_ID analog): every rank derives the
+  // same id locally — no out-of-band distribution. Rank 0 binds the given
+  // port at vcclCommInitRank time instead of here.
+  if (const char* env = std::getenv("VCCL_COMM_ID")) {
+    const char* colon = strrchr(env, ':');
+    SocketAddr addr;
+    memset(&addr.storage, 0, sizeof(addr.storage));
+    auto* in = reinterpret_cast<sockaddr_in*>(&addr.storage);
+    char host[64] = {0};
+    if (colon == nullptr || colon == env ||
+        static_cast<size_t>(colon - env) >= sizeof(host)) {
+      VCCL_ERR("VCCL_COMM_ID must be <ip>:<port>, got '%s'", env);
+      return vcclInvalidArgument;
+    }
+    memcpy(host, env, colon - env);
+    int port = atoi(colon + 1);
+    if (inet_pton(AF_INET, host, &in->sin_addr) != 1 || port <= 0 ||
+        port > 65535) {
+      VCCL_ERR("VCCL_COMM_ID must be <ipv4>:<port>, got '%s'", env);
+      return vcclInvalidArgument;
+    }
+    in->sin_family = AF_INET;
+    in->sin_port = htons(static_cast<uint16_t>(port));
+    addr.len = sizeof(sockaddr_in);
+    id->magic = kVcclMagic;
+    id->salt = kCommIdEnvSalt;
+    id->setAddr(addr);
+    VCCL_INFO("unique id derived from VCCL_COMM_ID=%s", env);
+    return vcclSuccess;
+  }
+
   SocketAddr addr;
   VCCLCHECK(getAdvertisedAddr(&addr));
 
@@ -104,14 +137,21 @@ vcclResult_t Bootstrap::init(const vcclUniqueId& id, int rank, int nranks,
     {
       std::lock_guard<std::mutex> lock(g_registryMutex);
       auto it = g_listenRegistry.find(idKey(id));
-      if (it == g_listenRegistry.end()) {
-        VCCL_ERR(
-            "rank 0 must call vcclCommInitRank in the process that called "
-            "vcclGetUniqueId");
-        return vcclInvalidUsage;
+      if (it != g_listenRegistry.end()) {
+        listenFd = it->second;
+        g_listenRegistry.erase(it);
       }
-      listenFd = it->second;
-      g_listenRegistry.erase(it);
+    }
+    if (listenFd < 0 && internal->salt == kCommIdEnvSalt) {
+      // Id came from VCCL_COMM_ID: bind the well-known port now.
+      SocketAddr addr = internal->getAddr();
+      VCCLCHECK(createListenSocket(&listenFd, addr.port(), nullptr));
+    }
+    if (listenFd < 0) {
+      VCCL_ERR(
+          "rank 0 must call vcclCommInitRank in the process that called "
+          "vcclGetUniqueId");
+      return vcclInvalidUsage;
     }
     bs->peerFds_.assign(nranks, -1);
     for (int i = 0; i < nranks - 1; i++) {

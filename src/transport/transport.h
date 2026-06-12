@@ -2,14 +2,24 @@
 #ifndef VCCL_TRANSPORT_TRANSPORT_H_
 #define VCCL_TRANSPORT_TRANSPORT_H_
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 #include "vccl.h"
 
 namespace vccl {
 
 class Bootstrap;
+
+// One point-to-point transfer inside a batch.
+struct P2pOp {
+  bool isSend;
+  int peer;
+  void* buf;  // const-cast for sends; never written
+  size_t bytes;
+};
 
 // Point-to-point byte transport between the ranks of one communicator.
 // Connections to all peers are established during create(). All calls are
@@ -24,6 +34,17 @@ class Transport {
   virtual vcclResult_t recv(int peer, void* buf, size_t bytes) = 0;
   virtual vcclResult_t sendRecv(int sendPeer, const void* sbuf, size_t sbytes,
                                 int recvPeer, void* rbuf, size_t rbytes) = 0;
+
+  // Progress a set of transfers concurrently (vcclGroupStart/End semantics):
+  // a send+recv pair with one peer must not deadlock against the mirrored
+  // pair on the other side. Multiple same-direction ops to one peer complete
+  // in issue order.
+  virtual vcclResult_t batch(const std::vector<P2pOp>& ops) = 0;
+
+  // Make any blocked operation fail promptly (vcclCommAbort). Thread-safe.
+  virtual void abort() { aborted_.store(true, std::memory_order_relaxed); }
+  bool isAborted() const { return aborted_.load(std::memory_order_relaxed); }
+
   virtual const char* name() const = 0;
 
   // Pin a buffer with the transport ahead of use. Collectives touching any
@@ -48,6 +69,18 @@ class Transport {
     (void)handle;
     return vcclSuccess;
   }
+
+  // True when [buf, buf+bytes) already lies inside a persistent
+  // registration (user-pinned or dmabuf), so a caller should not pin it
+  // again — notably dmabuf mappings, which cannot be pinned via regMr.
+  virtual bool covers(const void* buf, size_t bytes) const {
+    (void)buf;
+    (void)bytes;
+    return false;
+  }
+
+ protected:
+  std::atomic<bool> aborted_{false};
 };
 
 // TCP sockets, full mesh. Always available.

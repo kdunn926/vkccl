@@ -16,6 +16,9 @@ LogLevel logLevel();
 void logMsg(LogLevel level, const char* fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
+// Most recent error message logged by this thread (for vcclGetLastError).
+const char* lastErrorString();
+
 }  // namespace vccl
 
 #define VCCL_LOG(level, ...)                                  \

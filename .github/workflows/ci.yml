@@ -42,6 +42,11 @@ jobs:
         run: |
           VCCL_LIBRARY="$PWD/build/libvccl.so" VCCL_TRANSPORT=verbs \
             python3 python/tests/test_bindings.py
+      - name: Torch communicator + e2e TP tests
+        run: |
+          python3 -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          VCCL_LIBRARY="$PWD/build/libvccl.so" python3 python/tests/test_torch_comm.py
+          VCCL_LIBRARY="$PWD/build/libvccl.so" python3 python/tests/test_e2e_tp.py
 
   macos:
     runs-on: macos-latest

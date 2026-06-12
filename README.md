@@ -27,8 +27,30 @@ See [PLAN.md](PLAN.md) for the architecture and roadmap.
   two QEMU VMs, one rank each, all-reduce/all-gather over Soft-RoCE across
   an inter-VM network with `--check` passing. `VCCL_TIMEOUT` watchdog on all
   blocking paths.
-- ⬜ Pending: BC-250 + RoCE NIC validation, GPU reduction shaders, the
-  vllm-vulkan platform patch (see `python/vccl/torch_comm.py` docstring).
+- ✅ Full NCCL/RCCL API surface: reduce, gather/scatter, all-to-all(v) (RCCL
+  extensions), bcast, group semantics (`vcclGroupStart`/`End` with batched
+  point-to-point progress), `vcclCommInitAll`/`InitRankConfig`/`Split`/
+  `Finalize`/`Abort`/`GetAsyncError`/`Device`, `vcclMemAlloc`/`MemFree`,
+  PreMulSum custom ops, `vcclGetVersion`/`GetLastError`. All covered by the
+  multi-process suite over TCP (macOS) and Soft-RoCE (Linux VM).
+- ✅ vllm-vulkan integration: `integration/vllm-vulkan-vccl.patch` makes the
+  platform resolve its device communicator to `VcclCommunicator`;
+  `python/tests/test_e2e_tp.py` exercises a full TP forward (column/row
+  parallel MLP + LM head + pipeline send/recv) against an unsharded
+  reference and verifies the patched platform resolution.
+- ⬜ Pending: BC-250 + RoCE NIC validation (performance + dmabuf MR direct
+  path), GPU reduction shaders for non-host-visible dGPU VRAM.
+
+## Bare-metal bring-up kit
+
+`kit/` builds fully static x86_64 binaries (musl, RDMA providers linked in)
+for verifying 2-node RDMA on fresh hardware from any initramfs — see
+[kit/README.md](kit/README.md). Rendezvous needs no shared storage:
+
+```sh
+nodeA# ./vccl-e2e.sh 0 2 <nodeA-ip>
+nodeB# ./vccl-e2e.sh 1 2 <nodeA-ip>
+```
 
 ## Build
 

@@ -1,13 +1,20 @@
 /* SPDX-License-Identifier: Apache-2.0 */
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <utility>
 #include <vector>
 
 #include "core/bootstrap.h"
 #include "transport/transport.h"
+#include "util/deadline.h"
 #include "util/log.h"
 #include "util/socket.h"
 
@@ -96,6 +103,90 @@ class TcpTransport final : public Transport {
                         int recvPeer, void* rbuf, size_t rbytes) override {
     return duplexTransfer(fds_[sendPeer], sbuf, sbytes, fds_[recvPeer], rbuf,
                           rbytes);
+  }
+
+  vcclResult_t batch(const std::vector<P2pOp>& ops) override {
+    // Per-(peer, direction) FIFOs: ops on one socket direction must run in
+    // issue order, while every other (peer, direction) progresses
+    // concurrently from a single thread.
+    struct Active {
+      const P2pOp* op;
+      size_t done = 0;
+    };
+    std::map<std::pair<int, bool>, std::deque<Active>> queues;
+    size_t remaining = 0;
+    for (const P2pOp& op : ops) {
+      if (op.bytes == 0) continue;
+      queues[{op.peer, op.isSend}].push_back({&op, 0});
+      remaining++;
+    }
+
+    Deadline deadline;
+    while (remaining > 0) {
+      bool progressed = false;
+      for (auto& entry : queues) {
+        auto& q = entry.second;
+        if (q.empty()) continue;
+        Active& a = q.front();
+        const int fd = fds_[entry.first.first];
+        char* base = static_cast<char*>(a.op->buf);
+        ssize_t k;
+        if (a.op->isSend) {
+          k = ::send(fd, base + a.done, a.op->bytes - a.done, kSendFlags);
+        } else {
+          k = ::recv(fd, base + a.done, a.op->bytes - a.done, 0);
+          if (k == 0) {
+            VCCL_ERR("batch recv: peer %d closed", entry.first.first);
+            return vcclSystemError;
+          }
+        }
+        if (k > 0) {
+          a.done += static_cast<size_t>(k);
+          progressed = true;
+          if (a.done == a.op->bytes) {
+            q.pop_front();
+            remaining--;
+          }
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK &&
+                   errno != EINTR) {
+          VCCL_ERR("batch %s failed: %s", a.op->isSend ? "send" : "recv",
+                   strerror(errno));
+          return vcclSystemError;
+        }
+      }
+      if (isAborted()) {
+        VCCL_ERR("batch aborted");
+        return vcclSystemError;
+      }
+      if (!progressed) {
+        // Park on the head of every queue until something is ready.
+        std::vector<pollfd> pfds;
+        for (auto& entry : queues) {
+          if (entry.second.empty()) continue;
+          pfds.push_back({fds_[entry.first.first],
+                          static_cast<short>(entry.first.second ? POLLOUT
+                                                                : POLLIN),
+                          0});
+        }
+        if (poll(pfds.data(), pfds.size(), deadline.pollMs()) < 0 &&
+            errno != EINTR) {
+          return vcclSystemError;
+        }
+        if (deadline.expired()) {
+          VCCL_ERR("batch timed out (VCCL_TIMEOUT)");
+          return vcclSystemError;
+        }
+      }
+    }
+    return vcclSuccess;
+  }
+
+  void abort() override {
+    Transport::abort();
+    // Wake anything parked in poll/send/recv on these sockets.
+    for (int fd : fds_) {
+      if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    }
   }
 
   const char* name() const override { return "tcp"; }

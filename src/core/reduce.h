@@ -13,6 +13,17 @@ namespace vccl {
 vcclResult_t cpuReduce(vcclDataType_t dt, vcclRedOp_t op, void* dst,
                        const void* src, size_t count);
 
+// dst[i] = dst[i] + preScale*src[i] (the PreMulSum accumulation step).
+// Float datatypes only.
+vcclResult_t cpuScaledAccumulate(vcclDataType_t dt, void* dst,
+                                 const void* src, size_t count,
+                                 double preScale);
+
+// dst[i] = factor*src[i] (PreMulSum's scaling of the local contribution).
+// dst may equal src. Float datatypes only.
+vcclResult_t cpuScaleCopy(vcclDataType_t dt, void* dst, const void* src,
+                          size_t count, double factor);
+
 // dst[i] *= factor, for the final averaging step. Float types only.
 vcclResult_t cpuScale(vcclDataType_t dt, void* dst, size_t count,
                       double factor);

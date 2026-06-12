@@ -21,6 +21,7 @@ set(VCCL_SOURCES
   src/core/bootstrap.cc
   src/core/comm.cc
   src/core/collectives.cc
+  src/core/group.cc
   src/transport/tcp.cc
   src/util/socket.cc
   src/util/log.cc
@@ -84,6 +85,11 @@ if(VCCL_BUILD_BENCH)
   add_executable(vccl-bench bench/vccl_bench.cc)
   target_link_libraries(vccl-bench PRIVATE vccl_static Threads::Threads)
   target_include_directories(vccl-bench PRIVATE include src)
+
+  if(VCCL_HAVE_VERBS)
+    add_executable(vccl-info tools/vccl_info.cc)
+    target_link_libraries(vccl-info PRIVATE ${IBVERBS_LIBRARY})
+  endif()
 
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_package(Vulkan QUIET)

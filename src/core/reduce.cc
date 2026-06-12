@@ -158,6 +158,81 @@ vcclResult_t cpuReduce(vcclDataType_t dt, vcclRedOp_t op, void* dst,
   }
 }
 
+vcclResult_t cpuScaledAccumulate(vcclDataType_t dt, void* dst,
+                                 const void* src, size_t count,
+                                 double preScale) {
+  switch (dt) {
+    case vcclFloat32: {
+      float* d = static_cast<float*>(dst);
+      const float* s = static_cast<const float*>(src);
+      const float k = static_cast<float>(preScale);
+      for (size_t i = 0; i < count; i++) d[i] += k * s[i];
+      return vcclSuccess;
+    }
+    case vcclFloat64: {
+      double* d = static_cast<double*>(dst);
+      const double* s = static_cast<const double*>(src);
+      for (size_t i = 0; i < count; i++) d[i] += preScale * s[i];
+      return vcclSuccess;
+    }
+    case vcclFloat16: {
+      uint16_t* d = static_cast<uint16_t*>(dst);
+      const uint16_t* s = static_cast<const uint16_t*>(src);
+      const float k = static_cast<float>(preScale);
+      for (size_t i = 0; i < count; i++)
+        d[i] = floatToHalf(halfToFloat(d[i]) + k * halfToFloat(s[i]));
+      return vcclSuccess;
+    }
+    case vcclBfloat16: {
+      uint16_t* d = static_cast<uint16_t*>(dst);
+      const uint16_t* s = static_cast<const uint16_t*>(src);
+      const float k = static_cast<float>(preScale);
+      for (size_t i = 0; i < count; i++)
+        d[i] = floatToBf16(bf16ToFloat(d[i]) + k * bf16ToFloat(s[i]));
+      return vcclSuccess;
+    }
+    default:
+      return vcclInvalidArgument;
+  }
+}
+
+vcclResult_t cpuScaleCopy(vcclDataType_t dt, void* dst, const void* src,
+                          size_t count, double factor) {
+  switch (dt) {
+    case vcclFloat32: {
+      float* d = static_cast<float*>(dst);
+      const float* s = static_cast<const float*>(src);
+      const float k = static_cast<float>(factor);
+      for (size_t i = 0; i < count; i++) d[i] = k * s[i];
+      return vcclSuccess;
+    }
+    case vcclFloat64: {
+      double* d = static_cast<double*>(dst);
+      const double* s = static_cast<const double*>(src);
+      for (size_t i = 0; i < count; i++) d[i] = factor * s[i];
+      return vcclSuccess;
+    }
+    case vcclFloat16: {
+      uint16_t* d = static_cast<uint16_t*>(dst);
+      const uint16_t* s = static_cast<const uint16_t*>(src);
+      const float k = static_cast<float>(factor);
+      for (size_t i = 0; i < count; i++)
+        d[i] = floatToHalf(k * halfToFloat(s[i]));
+      return vcclSuccess;
+    }
+    case vcclBfloat16: {
+      uint16_t* d = static_cast<uint16_t*>(dst);
+      const uint16_t* s = static_cast<const uint16_t*>(src);
+      const float k = static_cast<float>(factor);
+      for (size_t i = 0; i < count; i++)
+        d[i] = floatToBf16(k * bf16ToFloat(s[i]));
+      return vcclSuccess;
+    }
+    default:
+      return vcclInvalidArgument;
+  }
+}
+
 vcclResult_t cpuScale(vcclDataType_t dt, void* dst, size_t count,
                       double factor) {
   switch (dt) {

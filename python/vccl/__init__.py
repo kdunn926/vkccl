@@ -215,6 +215,14 @@ def get_unique_id() -> UniqueId:
     return uid
 
 
+def group_start() -> None:
+    _check(_lib().vcclGroupStart(), "vcclGroupStart")
+
+
+def group_end() -> None:
+    _check(_lib().vcclGroupEnd(), "vcclGroupEnd")
+
+
 class Communicator:
     """One rank's handle on a vccl communicator. Calls are blocking."""
 

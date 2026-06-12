@@ -30,6 +30,9 @@ static_assert(sizeof(UniqueIdInternal) <= VCCL_UNIQUE_ID_BYTES,
               "unique id too large");
 
 constexpr uint64_t kVcclMagic = 0x7663636c30312e30ull;  // "vccl01.0"
+// Marks ids derived from VCCL_COMM_ID: rank 0 binds the embedded port at
+// init time instead of holding a pre-bound socket in the registry.
+constexpr uint64_t kCommIdEnvSalt = 0x7663636c2d656e76ull;  // "vccl-env"
 
 vcclResult_t uniqueIdCreate(vcclUniqueId* out);
 
