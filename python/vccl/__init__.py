@@ -209,7 +209,34 @@ def _buffer_info(obj: Any, writable: bool) -> Tuple[int, int, Optional[DataType]
     return addr, view.nbytes, None
 
 
+def _ensure_bootstrap_addr() -> None:
+    """Pin the TCP bootstrap socket to a routable interface.
+
+    vcclGetUniqueId / vcclCommInitRank bind the bootstrap socket to the first
+    non-loopback interface. On RoCE hosts that is often the RDMA NIC's
+    link-local address (169.254/16), which is not reliably routable between
+    nodes (asymmetric routing / rp_filter), so peers get "connection refused".
+    If the caller has not pinned the interface (VCCL_SOCKET_ADDR /
+    VCCL_SOCKET_IFNAME), default VCCL_SOCKET_ADDR to the routable default-route
+    source IP. RDMA data still uses the RoCE GIDs; only the bootstrap moves.
+    """
+    if os.environ.get("VCCL_SOCKET_ADDR") or os.environ.get("VCCL_SOCKET_IFNAME"):
+        return
+    import socket as _socket
+
+    try:
+        sk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sk.connect(("8.8.8.8", 53))  # selects the default-route source IP; sends nothing
+        ip = sk.getsockname()[0]
+        sk.close()
+        if ip and not ip.startswith(("127.", "169.254.")):
+            os.environ["VCCL_SOCKET_ADDR"] = ip
+    except OSError:
+        pass
+
+
 def get_unique_id() -> UniqueId:
+    _ensure_bootstrap_addr()
     uid = UniqueId()
     _check(_lib().vcclGetUniqueId(ctypes.byref(uid)), "vcclGetUniqueId")
     return uid
@@ -227,6 +254,7 @@ class Communicator:
     """One rank's handle on a vccl communicator. Calls are blocking."""
 
     def __init__(self, nranks: int, unique_id: UniqueId, rank: int):
+        _ensure_bootstrap_addr()
         self._comm = ctypes.c_void_p()
         _check(
             _lib().vcclCommInitRank(
