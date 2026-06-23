@@ -5,6 +5,11 @@
 #include <cstdint>
 #include <cstring>
 
+#if defined(__x86_64__) || defined(__i386__)
+#define VCCL_X86 1
+#include <immintrin.h>
+#endif
+
 namespace vccl {
 namespace {
 
@@ -105,6 +110,117 @@ void reduce16(vcclRedOp_t op, uint16_t* dst, const uint16_t* src,
     dst[i] = FromFloat(applyOp(op, ToFloat(dst[i]), ToFloat(src[i])));
 }
 
+#ifdef VCCL_X86
+// SIMD fast paths for the hot reduce cases (fp32 all ops; fp16/bf16 sum).
+// Selected at runtime via __builtin_cpu_supports so the .so stays portable;
+// each kernel carries its own target attribute so it compiles without the
+// whole TU being built with -mavx2. Tails fall back to the scalar helpers
+// above, so results match the scalar path bit-for-bit on finite data.
+bool hasAvx2() {
+  static const bool ok = __builtin_cpu_supports("avx2");
+  return ok;
+}
+bool hasF16C() {
+  static const bool ok = __builtin_cpu_supports("f16c");
+  return ok;
+}
+
+__attribute__((target("avx2"))) void f32Sum(float* d, const float* s,
+                                            size_t n) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8)
+    _mm256_storeu_ps(
+        d + i, _mm256_add_ps(_mm256_loadu_ps(d + i), _mm256_loadu_ps(s + i)));
+  for (; i < n; i++) d[i] += s[i];
+}
+__attribute__((target("avx2"))) void f32Mul(float* d, const float* s,
+                                            size_t n) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8)
+    _mm256_storeu_ps(
+        d + i, _mm256_mul_ps(_mm256_loadu_ps(d + i), _mm256_loadu_ps(s + i)));
+  for (; i < n; i++) d[i] *= s[i];
+}
+__attribute__((target("avx2"))) void f32Max(float* d, const float* s,
+                                            size_t n) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8)
+    _mm256_storeu_ps(
+        d + i, _mm256_max_ps(_mm256_loadu_ps(d + i), _mm256_loadu_ps(s + i)));
+  for (; i < n; i++) d[i] = d[i] > s[i] ? d[i] : s[i];
+}
+__attribute__((target("avx2"))) void f32Min(float* d, const float* s,
+                                            size_t n) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8)
+    _mm256_storeu_ps(
+        d + i, _mm256_min_ps(_mm256_loadu_ps(d + i), _mm256_loadu_ps(s + i)));
+  for (; i < n; i++) d[i] = d[i] < s[i] ? d[i] : s[i];
+}
+
+// Dispatch fp32 by op; returns false if the op has no SIMD path (caller falls
+// back to scalar).
+bool f32SimdReduce(vcclRedOp_t op, float* d, const float* s, size_t n) {
+  switch (op) {
+    case vcclProd: f32Mul(d, s, n); return true;
+    case vcclMax: f32Max(d, s, n); return true;
+    case vcclMin: f32Min(d, s, n); return true;
+    case vcclSum:
+    case vcclAvg: f32Sum(d, s, n); return true;
+    default: return false;
+  }
+}
+
+// fp16 sum via F16C convert (8-wide) + AVX2 add. Tail uses scalar half codecs.
+__attribute__((target("avx2,f16c"))) void f16Sum(uint16_t* d,
+                                                 const uint16_t* s, size_t n) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256 df =
+        _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(d + i)));
+    __m256 sf =
+        _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s + i)));
+    __m128i r = _mm256_cvtps_ph(_mm256_add_ps(df, sf),
+                                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i), r);
+  }
+  for (; i < n; i++)
+    d[i] = floatToHalf(halfToFloat(d[i]) + halfToFloat(s[i]));
+}
+
+// bf16 sum: widen (<<16) to fp32, add, round-to-nearest-even back to bf16.
+// Matches floatToBf16 for finite values; tail uses the scalar codec.
+__attribute__((target("avx2"))) void bf16Sum(uint16_t* d, const uint16_t* s,
+                                             size_t n) {
+  const __m256i one = _mm256_set1_epi32(1);
+  const __m256i bias = _mm256_set1_epi32(0x7fff);
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256i db = _mm256_slli_epi32(
+        _mm256_cvtepu16_epi32(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(d + i))),
+        16);
+    __m256i sb = _mm256_slli_epi32(
+        _mm256_cvtepu16_epi32(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + i))),
+        16);
+    __m256 r =
+        _mm256_add_ps(_mm256_castsi256_ps(db), _mm256_castsi256_ps(sb));
+    __m256i bits = _mm256_castps_si256(r);
+    __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(bits, 16), one);
+    __m256i rounded = _mm256_add_epi32(bits, _mm256_add_epi32(bias, lsb));
+    __m256i hi = _mm256_srli_epi32(rounded, 16);
+    // hi holds 8x uint16 in 32-bit lanes; pack to 8x uint16 in low 128 bits.
+    __m256i packed = _mm256_packus_epi32(hi, hi);
+    packed = _mm256_permute4x64_epi64(packed, _MM_SHUFFLE(3, 1, 2, 0));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i),
+                     _mm256_castsi256_si128(packed));
+  }
+  for (; i < n; i++)
+    d[i] = floatToBf16(bf16ToFloat(d[i]) + bf16ToFloat(s[i]));
+}
+#endif  // VCCL_X86
+
 }  // namespace
 
 vcclResult_t cpuReduce(vcclDataType_t dt, vcclRedOp_t op, void* dst,
@@ -136,6 +252,11 @@ vcclResult_t cpuReduce(vcclDataType_t dt, vcclRedOp_t op, void* dst,
                    static_cast<const uint64_t*>(src), count);
       return vcclSuccess;
     case vcclFloat32:
+#ifdef VCCL_X86
+      if (hasAvx2() && f32SimdReduce(op, static_cast<float*>(dst),
+                                     static_cast<const float*>(src), count))
+        return vcclSuccess;
+#endif
       reduceNative(op, static_cast<float*>(dst),
                    static_cast<const float*>(src), count);
       return vcclSuccess;
@@ -144,11 +265,25 @@ vcclResult_t cpuReduce(vcclDataType_t dt, vcclRedOp_t op, void* dst,
                    static_cast<const double*>(src), count);
       return vcclSuccess;
     case vcclFloat16:
+#ifdef VCCL_X86
+      if (op == vcclSum && hasAvx2() && hasF16C()) {
+        f16Sum(static_cast<uint16_t*>(dst),
+               static_cast<const uint16_t*>(src), count);
+        return vcclSuccess;
+      }
+#endif
       reduce16<halfToFloat, floatToHalf>(op, static_cast<uint16_t*>(dst),
                                          static_cast<const uint16_t*>(src),
                                          count);
       return vcclSuccess;
     case vcclBfloat16:
+#ifdef VCCL_X86
+      if (op == vcclSum && hasAvx2()) {
+        bf16Sum(static_cast<uint16_t*>(dst),
+                static_cast<const uint16_t*>(src), count);
+        return vcclSuccess;
+      }
+#endif
       reduce16<bf16ToFloat, floatToBf16>(op, static_cast<uint16_t*>(dst),
                                          static_cast<const uint16_t*>(src),
                                          count);
