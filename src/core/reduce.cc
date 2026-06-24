@@ -111,17 +111,25 @@ void reduce16(vcclRedOp_t op, uint16_t* dst, const uint16_t* src,
 }
 
 #ifdef VCCL_X86
+#include <cpuid.h>
 // SIMD fast paths for the hot reduce cases (fp32 all ops; fp16/bf16 sum).
-// Selected at runtime via __builtin_cpu_supports so the .so stays portable;
-// each kernel carries its own target attribute so it compiles without the
-// whole TU being built with -mavx2. Tails fall back to the scalar helpers
-// above, so results match the scalar path bit-for-bit on finite data.
+// CPU features are probed once via raw CPUID (not __builtin_cpu_supports, whose
+// __cpu_model reference fails to link as PIC under lld); each kernel carries its
+// own target attribute so it compiles without the whole TU being built with
+// -mavx2. Tails fall back to the scalar helpers above, so results match the
+// scalar path bit-for-bit on finite data.
 bool hasAvx2() {
-  static const bool ok = __builtin_cpu_supports("avx2");
+  static const bool ok = [] {
+    unsigned a, b, c, d;
+    return __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & (1u << 5));  // AVX2
+  }();
   return ok;
 }
 bool hasF16C() {
-  static const bool ok = __builtin_cpu_supports("f16c");
+  static const bool ok = [] {
+    unsigned a, b, c, d;
+    return __get_cpuid(1, &a, &b, &c, &d) && (c & (1u << 29));  // F16C
+  }();
   return ok;
 }
 
