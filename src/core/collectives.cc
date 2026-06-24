@@ -160,6 +160,43 @@ vcclResult_t recursiveDoublingAllGather(vcclComm_t comm, char* data,
   return vcclSuccess;
 }
 
+// Bruck all-gather: a ceil(log2(n))-step algorithm that works for ANY n, not
+// just powers of two -- so non-power-of-two communicators (e.g. the 10-node
+// target, or any odd subset) still get logarithmic latency instead of the
+// ring's n-1 steps. At step k each rank sends its accumulated prefix to
+// (rank - 2^k) and receives the next blocks from (rank + 2^k); the last step
+// is partial when n isn't a power of two. Data lands in a rank-rotated order
+// in recvbuf (RDMA stays on the persistently-registered recvbuf); a final CPU
+// rotation reorders it to [rank 0 .. rank n-1].
+vcclResult_t bruckAllGather(vcclComm_t comm, char* recv, size_t chunkBytes) {
+  const int n = comm->nranks;
+  const int rank = comm->rank;
+  // Bruck accumulates from slot 0; doAllGather placed our block at slot rank.
+  if (rank != 0)
+    memcpy(recv, recv + static_cast<size_t>(rank) * chunkBytes, chunkBytes);
+
+  size_t curr = chunkBytes;  // bytes accumulated at recv[0..curr)
+  for (int pof2 = 1; pof2 < n; pof2 <<= 1) {
+    const int dst = (rank - pof2 + n) % n;  // send to
+    const int src = (rank + pof2) % n;      // receive from
+    const size_t xfer = (pof2 <= n - pof2)
+                            ? curr
+                            : static_cast<size_t>(n - pof2) * chunkBytes;
+    VCCLCHECK(comm->transport->sendRecv(dst, recv, xfer, src, recv + curr,
+                                        xfer));
+    curr += xfer;
+  }
+  // Final reorder: recv[i] holds rank (rank+i)%n -> move to slot (rank+i)%n.
+  std::vector<char> tmp(static_cast<size_t>(n) * chunkBytes);
+  for (int i = 0; i < n; i++) {
+    const int slot = (rank + i) % n;
+    memcpy(tmp.data() + static_cast<size_t>(slot) * chunkBytes,
+           recv + static_cast<size_t>(i) * chunkBytes, chunkBytes);
+  }
+  memcpy(recv, tmp.data(), static_cast<size_t>(n) * chunkBytes);
+  return vcclSuccess;
+}
+
 vcclResult_t doAllGather(const void* sendbuff, void* recvbuff,
                          size_t sendcount, vcclDataType_t datatype,
                          vcclComm_t comm) {
@@ -188,8 +225,11 @@ vcclResult_t doAllGather(const void* sendbuff, void* recvbuff,
     rdMax = std::strtoull(e, nullptr, 10);
   const int n = comm->nranks;
   const bool pow2 = n > 1 && (n & (n - 1)) == 0;
-  if (pow2 && !forceRing && (forceRD || chunkBytes <= rdMax)) {
-    return recursiveDoublingAllGather(comm, recv, chunkBytes);
+  if (!forceRing && (forceRD || chunkBytes <= rdMax)) {
+    // log-step path: recursive doubling for power-of-two n (no reorder needed),
+    // Bruck for everything else (any n) -- both ceil(log2(n)) steps.
+    if (pow2) return recursiveDoublingAllGather(comm, recv, chunkBytes);
+    return bruckAllGather(comm, recv, chunkBytes);
   }
   std::vector<Chunk> chunks(comm->nranks);
   for (int i = 0; i < comm->nranks; i++)
