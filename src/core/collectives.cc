@@ -27,6 +27,7 @@
  * consecutive runs become one Transport::batch.
  */
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <vector>
@@ -136,6 +137,29 @@ vcclResult_t ringAllGather(vcclComm_t comm, char* data,
   return vcclSuccess;
 }
 
+// Recursive-doubling all-gather: log2(n) steps instead of the ring's n-1, so
+// latency scales with log(n) rather than n (e.g. 2 steps at n=4 vs 3, 3 at n=8
+// vs 7). Power-of-two n only. At step i (distance mask = 2^i) rank r exchanges
+// its contiguous accumulated block with partner r^mask; the block doubles each
+// step and stays aligned to 2^i, so recvbuf ends in rank order. Same total
+// bytes moved as the ring (bandwidth-optimal), in fewer, larger messages.
+vcclResult_t recursiveDoublingAllGather(vcclComm_t comm, char* data,
+                                        size_t chunkBytes) {
+  const int n = comm->nranks;
+  const int r = comm->rank;
+  size_t curr = chunkBytes;  // bytes I currently hold (one contiguous block)
+  int i = 0;
+  for (int mask = 1; mask < n; mask <<= 1, ++i) {
+    const int dst = r ^ mask;
+    const size_t sendOff = static_cast<size_t>((r >> i) << i) * chunkBytes;
+    const size_t recvOff = static_cast<size_t>((dst >> i) << i) * chunkBytes;
+    VCCLCHECK(comm->transport->sendRecv(dst, data + sendOff, curr, dst,
+                                        data + recvOff, curr));
+    curr *= 2;
+  }
+  return vcclSuccess;
+}
+
 vcclResult_t doAllGather(const void* sendbuff, void* recvbuff,
                          size_t sendcount, vcclDataType_t datatype,
                          vcclComm_t comm) {
@@ -150,6 +174,23 @@ vcclResult_t doAllGather(const void* sendbuff, void* recvbuff,
   }
   if (comm->nranks == 1 || sendcount == 0) return vcclSuccess;
 
+  // Algorithm choice: recursive doubling is latency-optimal (log2(n) steps) and
+  // wins for small messages; the ring is bandwidth-optimal (constant-size
+  // messages, less fabric contention) and wins for large. So use recursive
+  // doubling for power-of-two n below a per-chunk byte threshold, ring above.
+  //   VCCL_ALLGATHER_ALGO = ring | recdouble   force one (A/B benchmarking)
+  //   VCCL_ALLGATHER_RD_MAX = <bytes>          threshold (default 64 KiB)
+  const char* algo = std::getenv("VCCL_ALLGATHER_ALGO");
+  const bool forceRing = algo != nullptr && std::strcmp(algo, "ring") == 0;
+  const bool forceRD = algo != nullptr && std::strcmp(algo, "recdouble") == 0;
+  size_t rdMax = 65536;
+  if (const char* e = std::getenv("VCCL_ALLGATHER_RD_MAX"))
+    rdMax = std::strtoull(e, nullptr, 10);
+  const int n = comm->nranks;
+  const bool pow2 = n > 1 && (n & (n - 1)) == 0;
+  if (pow2 && !forceRing && (forceRD || chunkBytes <= rdMax)) {
+    return recursiveDoublingAllGather(comm, recv, chunkBytes);
+  }
   std::vector<Chunk> chunks(comm->nranks);
   for (int i = 0; i < comm->nranks; i++)
     chunks[i] = {i * chunkBytes, chunkBytes};
