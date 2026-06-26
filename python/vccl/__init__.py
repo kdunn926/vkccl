@@ -264,6 +264,14 @@ class Communicator:
         self.rank = rank
         self.nranks = nranks
 
+    @property
+    def handle(self) -> int:
+        """Raw ``vcclComm_t`` pointer as an int, for native (non-Python)
+        bindings that call the C collectives directly on this communicator
+        (e.g. the vllm-vulkan Rust FFI: ``model.set_collective_comm(comm.handle)``).
+        0 after ``destroy()``."""
+        return self._comm.value or 0
+
     # ── helpers ──────────────────────────────────────────────────────────
     def _resolve(self, buf: Any, count: Optional[int],
                  dtype: Optional[DataType], writable: bool,
