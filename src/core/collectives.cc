@@ -305,6 +305,30 @@ vcclResult_t doReduceScatter(const void* sendbuff, void* recvbuff,
   return vcclSuccess;
 }
 
+// Recursive-doubling all-reduce: log2(n) steps instead of the ring's 2(n-1).
+// At step i (mask = 2^i) rank r exchanges its FULL accumulator with partner
+// r^mask and reduces the received copy in. Power-of-two n only. Latency-optimal
+// (e.g. n=4: 2 sendRecv vs the ring's 6) at the cost of moving the whole buffer
+// each step (n× the ring's bytes) -- the right trade for SMALL, latency-bound
+// messages (the BC-250 TP decode reduce: 20 KB over PCIe-2.0-x2 RoCE). Avg
+// scaling is applied once at the end. `recv` already holds this rank's
+// (premul-scaled) contribution; `scratch` is a full-size receive buffer.
+vcclResult_t recursiveDoublingAllReduce(vcclComm_t comm, char* recv,
+                                        size_t count, vcclDataType_t dt,
+                                        vcclRedOp_t op) {
+  const int n = comm->nranks;
+  const int r = comm->rank;
+  const size_t bytes = count * vcclTypeSize(dt);
+  char* scratch = comm->scratchAt(bytes);
+  for (int mask = 1; mask < n; mask <<= 1) {
+    const int peer = r ^ mask;
+    VCCLCHECK(comm->transport->sendRecv(peer, recv, bytes, peer, scratch,
+                                        bytes));
+    VCCLCHECK(vccl::cpuReduce(dt, op, recv, scratch, count));
+  }
+  return vcclSuccess;
+}
+
 vcclResult_t doAllReduce(const void* sendbuff, void* recvbuff, size_t count,
                          vcclDataType_t datatype, vcclRedOp_t op, bool premul,
                          double scalar, vcclComm_t comm) {
@@ -317,6 +341,28 @@ vcclResult_t doAllReduce(const void* sendbuff, void* recvbuff, size_t count,
   // ring reduces as a plain sum.
   if (premul) VCCLCHECK(vccl::cpuScale(datatype, recv, count, scalar));
   if (comm->nranks == 1 || count == 0) return vcclSuccess;
+
+  // Algorithm choice (mirrors doAllGather): recursive doubling is latency-
+  // optimal (log2(n) steps) and wins for small messages; the ring reduce-
+  // scatter+all-gather is bandwidth-optimal and wins for large.
+  //   VCCL_ALLREDUCE_ALGO = ring | recdouble   force one (A/B benchmarking)
+  //   VCCL_ALLREDUCE_RD_MAX = <bytes>          threshold (default 256 KiB)
+  // Recursive doubling needs power-of-two n; non-pow2 always uses the ring.
+  const char* algo = std::getenv("VCCL_ALLREDUCE_ALGO");
+  const bool forceRing = algo != nullptr && std::strcmp(algo, "ring") == 0;
+  const bool forceRD = algo != nullptr && std::strcmp(algo, "recdouble") == 0;
+  size_t rdMax = 262144;
+  if (const char* e = std::getenv("VCCL_ALLREDUCE_RD_MAX"))
+    rdMax = std::strtoull(e, nullptr, 10);
+  const int n = comm->nranks;
+  const bool pow2 = n > 1 && (n & (n - 1)) == 0;
+  const size_t bytes = count * esize;
+  if (pow2 && !forceRing && (forceRD || bytes <= rdMax)) {
+    VCCLCHECK(recursiveDoublingAllReduce(comm, recv, count, datatype, op));
+    if (op == vcclAvg)
+      VCCLCHECK(vccl::cpuScale(datatype, recv, count, 1.0 / n));
+    return vcclSuccess;
+  }
 
   std::vector<Chunk> chunks = makeChunks(count, comm->nranks, esize);
   VCCLCHECK(ringReduceScatter(comm, recv, chunks, datatype, op));
