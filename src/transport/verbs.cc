@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,42 @@ namespace {
 
 constexpr size_t kMaxSegBytes = 1ull << 30;
 constexpr int kQueueDepth = 128;
+
+// ---- per-step instrumentation (VCCL_PROF=1) -------------------------------
+// Accumulates sub-phase timings of sendRecv so we can localize the n=4 tax.
+struct Prof {
+  bool on = false;
+  long steps = 0;
+  double post_us = 0, poll_us = 0, spin0 = 0, polls = 0;  // sums
+  double wait_first_us = 0;  // time until FIRST completion arrives
+  using clk = std::chrono::steady_clock;
+  static double now_us() {
+    return std::chrono::duration<double, std::micro>(
+               clk::now().time_since_epoch())
+        .count();
+  }
+};
+inline Prof& prof() {
+  static Prof p = [] {
+    Prof q;
+    const char* e = std::getenv("VCCL_PROF");
+    q.on = e != nullptr && e[0] == '1';
+    return q;
+  }();
+  return p;
+}
+inline void profDump(int rank) {
+  Prof& p = prof();
+  if (!p.on || p.steps == 0) return;
+  fprintf(stdout,
+          "[VCCL_PROF r%d] steps=%ld  post=%.1fus/step  poll=%.1fus/step  "
+          "wait_first=%.1fus/step  poll_calls=%.1f/step  empty_polls=%.1f/step\n",
+          rank, p.steps, p.post_us / p.steps, p.poll_us / p.steps,
+          p.wait_first_us / p.steps, p.polls / p.steps, p.spin0 / p.steps);
+  // reset so successive collectives report fresh windows if dumped repeatedly
+  p.steps = 0;
+  p.post_us = p.poll_us = p.spin0 = p.polls = p.wait_first_us = 0;
+}
 // Inline-send threshold to request at QP creation: payloads this small ride
 // inside the WQE (lower latency, no memory registration involved).
 constexpr uint32_t kWantInline = 220;
@@ -205,6 +242,7 @@ class VerbsTransport final : public Transport {
 
     const int rank = bs->rank();
     const int nranks = bs->nranks();
+    t->rank_ = rank;
     t->cqs_.assign(nranks, nullptr);
     t->qps_.assign(nranks, nullptr);
     t->maxInline_.assign(nranks, 0);
@@ -313,6 +351,7 @@ class VerbsTransport final : public Transport {
   }
 
   ~VerbsTransport() override {
+    profDump(rank_);
     for (auto& region : regions_) {
       ibv_dereg_mr(region.mr);
       free(region.staging);
@@ -343,11 +382,21 @@ class VerbsTransport final : public Transport {
 
   vcclResult_t sendRecv(int sendPeer, const void* sbuf, size_t sbytes,
                         int recvPeer, void* rbuf, size_t rbytes) override {
+    Prof& pf = prof();
+    double t0 = pf.on ? Prof::now_us() : 0;
     int sendWrs = 0, recvWrs = 0;
     if (rbytes > 0) VCCLCHECK(postRecv(recvPeer, rbuf, rbytes, &recvWrs));
     if (sbytes > 0) VCCLCHECK(postSend(sendPeer, sbuf, sbytes, &sendWrs));
+    double t1 = pf.on ? Prof::now_us() : 0;
     if (sendPeer == recvPeer) {
       VCCLCHECK(pollPeer(sendPeer, sendWrs, recvWrs));
+      if (pf.on) {
+        double t2 = Prof::now_us();
+        pf.steps++;
+        pf.post_us += (t1 - t0);
+        pf.poll_us += (t2 - t1);
+        if (pf.steps >= 256) { profDump(rank_); fflush(stdout); }
+      }
     } else {
       // Poll both CQs; either side may finish first.
       Deadline deadline;
@@ -511,7 +560,20 @@ class VerbsTransport final : public Transport {
     rtr.dest_qp_num = theirs.qpn;
     rtr.rq_psn = theirs.psn;
     rtr.max_dest_rd_atomic = 1;
-    rtr.min_rnr_timer = 12;
+    // RNR NAK timer: how long a sender waits before retrying when the receiver
+    // hasn't posted its recv yet. In multi-step collectives (ring/recdouble at
+    // n>=3) a rank routinely posts its send for step s+1 a hair before its
+    // partner finishes step s's cpuReduce and posts the matching recv, so RNR
+    // NAKs are normal and self-correct -- but the timer value sets the stall
+    // cost. The default index 12 = 0.64 ms makes each such event catastrophic
+    // (a 0.1 ms reduce balloons to multiple ms once a few RNRs hit), and how
+    // often they hit is a fragile function of per-rank timing jitter (it varies
+    // with the compiler that built the lib). Index 1 = 0.01 ms (the smallest
+    // non-"655ms" value) keeps the retry essentially free, so the collective is
+    // RNR-immune regardless of arrival skew. Override with VCCL_MIN_RNR_TIMER.
+    rtr.min_rnr_timer = 1;
+    if (const char* e = std::getenv("VCCL_MIN_RNR_TIMER"))
+      rtr.min_rnr_timer = static_cast<uint8_t>(atoi(e) & 0x1f);
     rtr.ah_attr.port_num = dev_.port;
     if (dev_.roce) {
       rtr.ah_attr.is_global = 1;
@@ -682,9 +744,21 @@ class VerbsTransport final : public Transport {
 
   vcclResult_t pollPeer(int peer, int sendWrs, int recvWrs) {
     Deadline deadline;
+    Prof& pf = prof();
+    double tstart = pf.on ? Prof::now_us() : 0;
+    bool sawFirst = false;
     int sendDone = 0, recvDone = 0;
     while (sendDone < sendWrs || recvDone < recvWrs) {
+      int before = sendDone + recvDone;
       VCCLCHECK(pollOnce(peer, &sendDone, &recvDone));
+      if (pf.on) {
+        pf.polls += 1;
+        if (sendDone + recvDone == before) pf.spin0 += 1;
+        else if (!sawFirst) {
+          sawFirst = true;
+          pf.wait_first_us += (Prof::now_us() - tstart);
+        }
+      }
       if (isAborted()) {
         VCCL_ERR("operation aborted (peer %d)", peer);
         return vcclSystemError;
@@ -698,6 +772,7 @@ class VerbsTransport final : public Transport {
   }
 
   Device dev_;
+  int rank_ = -1;
   std::vector<ibv_cq*> cqs_;
   std::vector<ibv_qp*> qps_;
   std::vector<uint32_t> maxInline_;
