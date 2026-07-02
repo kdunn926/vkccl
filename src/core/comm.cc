@@ -165,6 +165,7 @@ vcclResult_t vcclCommGetAsyncError(vcclComm_t comm,
 
 vcclResult_t vcclCommDestroy(vcclComm_t comm) {
   if (comm != nullptr) {
+    std::lock_guard<std::mutex> lock(comm->regMutex);
     for (vcclComm::MemReg* reg : comm->registrations) {
       if (comm->transport) comm->transport->deregMr(reg->transportHandle);
       if (reg->mapped != nullptr) munmap(reg->mapped, reg->bytes);
@@ -181,6 +182,7 @@ vcclResult_t vcclCommRegister(vcclComm_t comm, void* buff, size_t bytes,
     return vcclInvalidArgument;
   auto reg = std::make_unique<vcclComm::MemReg>();
   reg->bytes = bytes;
+  std::lock_guard<std::mutex> lock(comm->regMutex);
   if (comm->transport) {
     VCCLCHECK(comm->transport->regMr(buff, bytes, &reg->transportHandle));
   }
@@ -207,6 +209,7 @@ vcclResult_t vcclCommRegisterDmaBuf(vcclComm_t comm, int fd, uint64_t offset,
   auto reg = std::make_unique<vcclComm::MemReg>();
   reg->mapped = mapped;
   reg->bytes = bytes;
+  std::lock_guard<std::mutex> lock(comm->regMutex);
   if (comm->transport) {
     vcclResult_t res = comm->transport->regDmaBuf(fd, offset, mapped, bytes,
                                                   &reg->transportHandle);
@@ -224,6 +227,7 @@ vcclResult_t vcclCommRegisterDmaBuf(vcclComm_t comm, int fd, uint64_t offset,
 vcclResult_t vcclCommDeregister(vcclComm_t comm, vcclMemHandle_t handle) {
   if (comm == nullptr || handle == nullptr) return vcclInvalidArgument;
   auto* reg = static_cast<vcclComm::MemReg*>(handle);
+  std::lock_guard<std::mutex> lock(comm->regMutex);
   auto it = std::find(comm->registrations.begin(), comm->registrations.end(),
                       reg);
   if (it == comm->registrations.end()) return vcclInvalidArgument;

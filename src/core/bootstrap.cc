@@ -76,6 +76,11 @@ vcclResult_t uniqueIdCreate(vcclUniqueId* out) {
   // same id locally — no out-of-band distribution. Rank 0 binds the given
   // port at vcclCommInitRank time instead of here.
   if (const char* env = std::getenv("VCCL_COMM_ID")) {
+    // Contract: one live communicator per VCCL_COMM_ID value. All ranks derive
+    // the same id locally, so the id (and its embedded port) is shared; two
+    // OVERLAPPING comms on the same VCCL_COMM_ID would both try to bind that
+    // port (EADDRINUSE) — give each concurrent comm its own <ip>:<port>. For
+    // SEQUENTIAL reuse, every rank must recreate its comm in the same order.
     const char* colon = strrchr(env, ':');
     SocketAddr addr;
     memset(&addr.storage, 0, sizeof(addr.storage));
@@ -120,6 +125,12 @@ vcclResult_t uniqueIdCreate(vcclUniqueId* out) {
   }
 
   std::lock_guard<std::mutex> lock(g_registryMutex);
+  // Defensive: if a prior uid with this exact key was created and never
+  // claimed by a rank-0 vcclCommInitRank, close its leaked listen fd before
+  // overwriting the slot. (A random 64-bit salt makes real collisions
+  // astronomically unlikely; this bounds the abandoned-uid leak regardless.)
+  auto existing = g_listenRegistry.find(idKey(*out));
+  if (existing != g_listenRegistry.end()) closeQuiet(existing->second);
   g_listenRegistry[idKey(*out)] = listenFd;
   VCCL_INFO("unique id created, root at %s", addr.str().c_str());
   return vcclSuccess;

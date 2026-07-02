@@ -38,6 +38,11 @@ struct vcclComm {
   std::atomic<vcclResult_t> asyncError{vcclSuccess};
   std::atomic<bool> aborted{false};
   std::mutex errMutex;
+  // Guards the `registrations` vector against concurrent
+  // vcclCommRegister/Deregister. Collectives are NOT serialized by this; the
+  // documented contract (see vccl.h) is one collective per comm at a time,
+  // with no Register/Deregister concurrent with a running collective.
+  std::mutex regMutex;
   std::string lastError;
   // Scratch space for ring reduce steps, grown on demand.
   std::vector<char> scratch;

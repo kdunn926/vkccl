@@ -230,6 +230,15 @@ vcclResult_t vcclRedOpDestroy(vcclRedOp_t op, vcclComm_t comm);
 vcclResult_t vcclMemAlloc(void** ptr, size_t size);
 vcclResult_t vcclMemFree(void* ptr);
 
+/* ── Threading / concurrency contract ───────────────────────────────────
+ * Like NCCL, a single communicator processes one collective (or one
+ * vcclGroupStart/End batch) at a time: do not issue collectives on the same
+ * comm concurrently from multiple threads. vcclCommRegister/Deregister may be
+ * called concurrently with each other (they are internally synchronized), but
+ * MUST NOT run concurrently with a collective on the same comm, since a
+ * collective may create and tear down transport registrations on the fly.
+ * vcclCommAbort is safe to call from any thread at any time. */
+
 /* ── Memory registration ────────────────────────────────────────────────
  * Optional: collectives work on any host-accessible memory, but registering
  * buffers up front pins them with the RDMA transport once instead of on
