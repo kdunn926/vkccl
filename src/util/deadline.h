@@ -7,13 +7,13 @@
 
 namespace vccl {
 
-// Collective/transport watchdog from VCCL_TIMEOUT (seconds). Default 600;
+// Collective/transport watchdog from VCCL_TIMEOUT (seconds). Default 60;
 // 0 disables. A dead or wedged peer then fails the operation with an error
 // instead of hanging the job forever.
 inline int timeoutSeconds() {
   static int secs = [] {
     const char* env = std::getenv("VCCL_TIMEOUT");
-    return env != nullptr ? atoi(env) : 600;
+    return env != nullptr ? atoi(env) : 60;
   }();
   return secs;
 }
