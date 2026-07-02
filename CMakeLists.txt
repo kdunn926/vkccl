@@ -49,20 +49,30 @@ if(VCCL_ENABLE_VERBS)
   endif()
 endif()
 
-add_library(vccl SHARED ${VCCL_SOURCES})
-add_library(vccl_static STATIC ${VCCL_SOURCES})
+find_package(Threads REQUIRED)
 
+add_library(vccl_obj OBJECT ${VCCL_SOURCES})
+target_include_directories(vccl_obj
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+         $<INSTALL_INTERFACE:include>
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(vccl_obj PUBLIC Threads::Threads)
+if(VCCL_HAVE_VERBS)
+  target_compile_definitions(vccl_obj PRIVATE VCCL_HAVE_VERBS=1)
+  target_link_libraries(vccl_obj PUBLIC ${IBVERBS_LIBRARY})
+endif()
+
+# SHARED and STATIC both consume the single set of compiled objects; linking
+# the OBJECT library also propagates its include dirs and link deps (CMake >=
+# 3.12), so downstream targets (tests, bench) that link vccl_static still see
+# the headers and Threads.
+add_library(vccl SHARED $<TARGET_OBJECTS:vccl_obj>)
+add_library(vccl_static STATIC $<TARGET_OBJECTS:vccl_obj>)
 foreach(tgt vccl vccl_static)
+  target_link_libraries(${tgt} PUBLIC vccl_obj)
   target_include_directories(${tgt}
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-           $<INSTALL_INTERFACE:include>
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  if(VCCL_HAVE_VERBS)
-    target_compile_definitions(${tgt} PRIVATE VCCL_HAVE_VERBS=1)
-    target_link_libraries(${tgt} PRIVATE ${IBVERBS_LIBRARY})
-  endif()
-  find_package(Threads REQUIRED)
-  target_link_libraries(${tgt} PRIVATE Threads::Threads)
+           $<INSTALL_INTERFACE:include>)
 endforeach()
 
 set_target_properties(vccl PROPERTIES
