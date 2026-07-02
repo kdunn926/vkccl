@@ -7,7 +7,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -534,6 +536,81 @@ int runConfig(int nranks) {
   return failed ? 1 : 0;
 }
 
+// One rank dies mid-job; survivors must return an error within a short
+// VCCL_TIMEOUT (not hang), and a follow-up collective must fail fast with
+// vcclInvalidUsage (the latched-abort path). Uses TCP loopback.
+int killChildMain(int rank, int nranks, const vcclUniqueId& id, int victim) {
+  vcclComm_t comm = nullptr;
+  if (vcclCommInitRank(&comm, nranks, id, rank) != vcclSuccess ||
+      comm == nullptr) {
+    return 2;  // init itself failed unexpectedly
+  }
+  if (rank == victim) {
+    // Let every peer finish init and block in the collective, then crash like
+    // a dead node. raise(SIGKILL) is a genuine, deterministic kill: peers can
+    // never make ring progress without us, so they cannot have completed.
+    usleep(150 * 1000);
+    raise(SIGKILL);
+    _exit(0);  // unreachable
+  }
+  std::vector<float> buf(4096);
+  fillBuffer(buf.data(), vcclFloat32, rank, buf.size(), 0);
+  vcclResult_t r1 = vcclAllReduce(buf.data(), buf.data(), buf.size(),
+                                  vcclFloat32, vcclSum, comm);
+  // Latched abort (M3): a transport-fatal error must make later collectives
+  // fail immediately with vcclInvalidUsage instead of re-entering a dead
+  // transport / cascading QP errors.
+  vcclResult_t r2 = vcclAllReduce(buf.data(), buf.data(), buf.size(),
+                                  vcclFloat32, vcclSum, comm);
+  vcclResult_t async = vcclSuccess;
+  vcclCommGetAsyncError(comm, &async);
+  vcclCommDestroy(comm);
+  bool ok = r1 != vcclSuccess && r2 == vcclInvalidUsage && async != vcclSuccess;
+  if (!ok) {
+    fprintf(stderr, "kill survivor rank %d: r1=%d r2=%d async=%d\n", rank,
+            (int)r1, (int)r2, (int)async);
+  }
+  return ok ? 0 : 1;
+}
+
+int runKillOne(int nranks) {
+  // TCP loopback (verbs is unavailable on the dev box anyway) + a short
+  // watchdog so non-adjacent survivors fail via the deadline, not a hang.
+  setenv("VCCL_TRANSPORT", "tcp", 1);
+  setenv("VCCL_TIMEOUT", "3", 1);
+  const int victim = 1;
+  vcclUniqueId id;
+  if (vcclGetUniqueId(&id) != vcclSuccess) {
+    fprintf(stderr, "kill test: vcclGetUniqueId failed\n");
+    unsetenv("VCCL_TIMEOUT");
+    return 1;
+  }
+  std::vector<pid_t> pids;
+  for (int r = 0; r < nranks; r++) {
+    pid_t pid = fork();
+    if (pid == 0) _exit(killChildMain(r, nranks, id, victim));
+    pids.push_back(pid);
+  }
+  auto t0 = std::chrono::steady_clock::now();
+  int failed = 0;
+  for (size_t i = 0; i < pids.size(); i++) {
+    int status = 0;
+    waitpid(pids[i], &status, 0);
+    if ((int)i == victim) continue;  // victim is SIGKILLed by design
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failed++;
+  }
+  auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+  if (secs > 30) {  // ~3 s expected; a hang would blow past this
+    fprintf(stderr, "kill test took %llds (hang?)\n", (long long)secs);
+    failed++;
+  }
+  unsetenv("VCCL_TIMEOUT");
+  printf("kill-a-rank (nranks=%d): %s\n", nranks, failed ? "FAIL" : "OK");
+  fflush(stdout);
+  return failed ? 1 : 0;
+}
+
 }  // namespace
 
 // vcclCommInitAll: several in-process communicators; collectives on them
@@ -572,6 +649,7 @@ int testInitAll() {
 int main() {
   setenv("VCCL_SOCKET_ADDR", "127.0.0.1", 0);
   int failures = 0;
+  failures += runKillOne(5);   // must run before any parent-side collective
   for (int n : {1, 2, 3, 4, 5}) failures += runConfig(n);
   failures += testInitAll();
   if (failures == 0) printf("all tests passed\n");
