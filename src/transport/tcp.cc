@@ -21,8 +21,6 @@
 namespace vccl {
 namespace {
 
-constexpr int kConnectTimeoutMs = 120000;
-
 class TcpTransport final : public Transport {
  public:
   static vcclResult_t create(Bootstrap* bs, std::unique_ptr<Transport>* out) {
@@ -48,7 +46,7 @@ class TcpTransport final : public Transport {
 
     for (int peer = 0; peer < rank; peer++) {
       int fd = -1;
-      res = connectTo(addrs[peer], kConnectTimeoutMs, &fd);
+      res = connectTo(addrs[peer], connectTimeoutMs(), &fd);
       if (res != vcclSuccess) break;
       int32_t myRank = rank;
       res = sendAll(fd, &myRank, sizeof(myRank));

@@ -18,6 +18,14 @@ inline int timeoutSeconds() {
   return secs;
 }
 
+// Timeout for a single blocking connect(), in ms: VCCL_TIMEOUT capped at
+// 120 s, or 120 s when the watchdog is disabled (VCCL_TIMEOUT=0).
+inline int connectTimeoutMs() {
+  int secs = timeoutSeconds();
+  if (secs <= 0 || secs > 120) return 120000;
+  return secs * 1000;
+}
+
 class Deadline {
  public:
   Deadline() {

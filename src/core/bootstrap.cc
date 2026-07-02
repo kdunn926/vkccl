@@ -9,12 +9,11 @@
 #include <random>
 #include <string>
 
+#include "util/deadline.h"
 #include "util/log.h"
 
 namespace vccl {
 namespace {
-
-constexpr int kConnectTimeoutMs = 120000;
 
 // Listen sockets created by vcclGetUniqueId, waiting to be claimed by the
 // rank-0 vcclCommInitRank in the same process.
@@ -27,8 +26,13 @@ std::string idKey(const vcclUniqueId& id) {
 
 struct Hello {
   uint64_t magic;
-  int32_t rank;
+  uint64_t salt;
+  uint32_t version;  // VCCL_VERSION_CODE
+  int32_t  nranks;
+  int32_t  rank;
+  int32_t  pad;      // explicit, kept zero on the wire (M11: no uninit padding)
 };
+static_assert(sizeof(Hello) == 32, "Hello must have no implicit padding");
 
 }  // namespace
 
@@ -163,22 +167,41 @@ vcclResult_t Bootstrap::init(const vcclUniqueId& id, int rank, int nranks,
       }
       Hello hello{};
       res = recvAll(fd, &hello, sizeof(hello));
-      if (res != vcclSuccess || hello.magic != internal->magic ||
-          hello.rank <= 0 || hello.rank >= nranks ||
-          bs->peerFds_[hello.rank] != -1) {
-        VCCL_ERR("bootstrap: bad hello from peer");
+      const bool ok =
+          res == vcclSuccess && hello.magic == internal->magic &&
+          hello.salt == internal->salt &&
+          hello.version == static_cast<uint32_t>(VCCL_VERSION_CODE) &&
+          hello.nranks == nranks && hello.rank > 0 && hello.rank < nranks &&
+          bs->peerFds_[hello.rank] == -1;
+      // Reply accept(1)/reject(0) so a wrong-job client fails fast instead of
+      // hanging in sendAll/recvAll. Best-effort on the reject path.
+      uint8_t reply = ok ? 1 : 0;
+      sendAll(fd, &reply, sizeof(reply));
+      if (!ok) {
+        VCCL_ERR("bootstrap: rejected hello (magic/salt/version/nranks/rank)");
         closeQuiet(fd);
         closeQuiet(listenFd);
-        return res != vcclSuccess ? res : vcclInternalError;
+        return res != vcclSuccess ? res : vcclInvalidUsage;
       }
       bs->peerFds_[hello.rank] = fd;
     }
     closeQuiet(listenFd);
   } else {
-    VCCLCHECK(
-        connectTo(internal->getAddr(), kConnectTimeoutMs, &bs->rootFd_));
-    Hello hello{internal->magic, rank};
+    VCCLCHECK(connectTo(internal->getAddr(), connectTimeoutMs(), &bs->rootFd_));
+    Hello hello{};
+    hello.magic = internal->magic;
+    hello.salt = internal->salt;
+    hello.version = static_cast<uint32_t>(VCCL_VERSION_CODE);
+    hello.nranks = nranks;
+    hello.rank = rank;
     VCCLCHECK(sendAll(bs->rootFd_, &hello, sizeof(hello)));
+    uint8_t reply = 0;
+    VCCLCHECK(recvAll(bs->rootFd_, &reply, sizeof(reply)));
+    if (reply != 1) {
+      VCCL_ERR("bootstrap: root rejected rank %d (salt/version/nranks mismatch)",
+                rank);
+      return vcclInvalidUsage;
+    }
   }
 
   *out = std::move(bs);

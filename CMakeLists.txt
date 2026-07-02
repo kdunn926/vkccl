@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
-project(vccl VERSION 0.1.0 LANGUAGES C CXX)
+# Derive the project version from include/vccl.h (single source of truth).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/vccl.h" _vccl_hdr)
+string(REGEX MATCH "#define VCCL_MAJOR ([0-9]+)" _m "${_vccl_hdr}")
+set(_vccl_major "${CMAKE_MATCH_1}")
+string(REGEX MATCH "#define VCCL_MINOR ([0-9]+)" _m "${_vccl_hdr}")
+set(_vccl_minor "${CMAKE_MATCH_1}")
+string(REGEX MATCH "#define VCCL_PATCH ([0-9]+)" _m "${_vccl_hdr}")
+set(_vccl_patch "${CMAKE_MATCH_1}")
+project(vccl VERSION ${_vccl_major}.${_vccl_minor}.${_vccl_patch} LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
