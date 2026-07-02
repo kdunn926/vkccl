@@ -84,6 +84,7 @@ vcclResult_t checkArgs(const void* sendbuff, const void* recvbuff,
 vcclResult_t resolveOp(vcclComm_t comm, vcclDataType_t dt, vcclRedOp_t* op,
                        bool* premul, double* scalar) {
   *premul = false;
+  if (static_cast<int>(*op) < 0) return vcclInvalidArgument;
   if (*op >= vcclNumOps) {
     if (!comm->premulScalar(*op, scalar)) return vcclInvalidArgument;
     if (!isFloatType(dt)) return vcclInvalidArgument;
@@ -92,7 +93,6 @@ vcclResult_t resolveOp(vcclComm_t comm, vcclDataType_t dt, vcclRedOp_t* op,
     return vcclSuccess;
   }
   if (*op == vcclAvg && !isFloatType(dt)) return vcclInvalidArgument;
-  if (*op < 0) return vcclInvalidArgument;
   return vcclSuccess;
 }
 
@@ -186,14 +186,18 @@ vcclResult_t bruckAllGather(vcclComm_t comm, char* recv, size_t chunkBytes) {
                                         xfer));
     curr += xfer;
   }
-  // Final reorder: recv[i] holds rank (rank+i)%n -> move to slot (rank+i)%n.
-  std::vector<char> tmp(static_cast<size_t>(n) * chunkBytes);
-  for (int i = 0; i < n; i++) {
-    const int slot = (rank + i) % n;
-    memcpy(tmp.data() + static_cast<size_t>(slot) * chunkBytes,
-           recv + static_cast<size_t>(i) * chunkBytes, chunkBytes);
+  // Final reorder: recv[i] holds rank (rank+i)%n. For rank 0 that is the
+  // identity (slot==i), so skip. Otherwise rotate through the persistently
+  // registered scratch buffer instead of a per-call heap allocation (M6).
+  if (rank != 0) {
+    char* tmp = comm->scratchAt(static_cast<size_t>(n) * chunkBytes);
+    for (int i = 0; i < n; i++) {
+      const int slot = (rank + i) % n;
+      memcpy(tmp + static_cast<size_t>(slot) * chunkBytes,
+             recv + static_cast<size_t>(i) * chunkBytes, chunkBytes);
+    }
+    memcpy(recv, tmp, static_cast<size_t>(n) * chunkBytes);
   }
-  memcpy(recv, tmp.data(), static_cast<size_t>(n) * chunkBytes);
   return vcclSuccess;
 }
 

@@ -7,6 +7,7 @@
 
 #if defined(__x86_64__) || defined(__i386__)
 #define VCCL_X86 1
+#include <cpuid.h>
 #include <immintrin.h>
 #endif
 
@@ -111,7 +112,6 @@ void reduce16(vcclRedOp_t op, uint16_t* dst, const uint16_t* src,
 }
 
 #ifdef VCCL_X86
-#include <cpuid.h>
 // SIMD fast paths for the hot reduce cases (fp32 all ops; fp16/bf16 sum).
 // CPU features are probed once via raw CPUID (not __builtin_cpu_supports, whose
 // __cpu_model reference fails to link as PIC under lld); each kernel carries its
