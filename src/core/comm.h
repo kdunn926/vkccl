@@ -5,10 +5,13 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "core/bootstrap.h"
 #include "transport/transport.h"
+#include "util/log.h"
 #include "vccl.h"
 
 struct vcclComm {
@@ -34,6 +37,8 @@ struct vcclComm {
   std::vector<CustomOp> customOps;
   std::atomic<vcclResult_t> asyncError{vcclSuccess};
   std::atomic<bool> aborted{false};
+  std::mutex errMutex;
+  std::string lastError;
   // Scratch space for ring reduce steps, grown on demand.
   std::vector<char> scratch;
 
@@ -69,9 +74,22 @@ struct vcclComm {
   }
 
   void noteError(vcclResult_t res) {
-    if (res != vcclSuccess) {
-      vcclResult_t expected = vcclSuccess;
-      asyncError.compare_exchange_strong(expected, res);
+    if (res == vcclSuccess) return;
+    vcclResult_t expected = vcclSuccess;
+    asyncError.compare_exchange_strong(expected, res);
+    // Latch the comm dead on transport-fatal codes so later collectives fail
+    // cleanly with vcclInvalidUsage (via checkComm) instead of cascading
+    // "ibv_post_send failed" on a QP already in ERROR (M3).
+    if (res == vcclSystemError || res == vcclRemoteError ||
+        res == vcclInternalError || res == vcclUnhandledError)
+      aborted.store(true, std::memory_order_relaxed);
+    // Copy the failing thread's last-error text into the comm so
+    // vcclGetLastError works for grouped ops / vcclCommInitAll worker threads
+    // (M10).
+    const char* msg = vccl::lastErrorString();
+    if (msg != nullptr && msg[0] != '\0') {
+      std::lock_guard<std::mutex> lock(errMutex);
+      lastError = msg;
     }
   }
 };

@@ -40,7 +40,10 @@ vcclResult_t vcclGetVersion(int* version) {
 }
 
 const char* vcclGetLastError(vcclComm_t comm) {
-  (void)comm;
+  if (comm != nullptr) {
+    std::lock_guard<std::mutex> lock(comm->errMutex);
+    if (!comm->lastError.empty()) return comm->lastError.c_str();
+  }
   return vccl::lastErrorString();
 }
 
