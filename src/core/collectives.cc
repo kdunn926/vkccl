@@ -333,6 +333,62 @@ vcclResult_t recursiveDoublingAllReduce(vcclComm_t comm, char* recv,
   return vcclSuccess;
 }
 
+// Recursive-doubling all-reduce for NON-power-of-two n, via power-of-two
+// elimination (van de Geijn). r = n - 2^floor(log2 n) ranks fold their data
+// into a partner in one pre-step, leaving a 2^k "active" set that runs the
+// recursive-doubling core; one post-step scatters the result back to the
+// folded ranks. Cost log2-core + 2 half-steps vs the ring's 2(n-1). `recv`
+// holds this rank's (premul-scaled) contribution; `scratch` is full size.
+// All vccl ops are commutative, so the fold order matches the ring result
+// (float sum differs only by reduction order, within test tolerance).
+vcclResult_t pow2ElimAllReduce(vcclComm_t comm, char* recv, size_t count,
+                               vcclDataType_t dt, vcclRedOp_t op) {
+  const int n = comm->nranks;
+  const int r = comm->rank;
+  const size_t bytes = count * vcclTypeSize(dt);
+  char* scratch = comm->scratchAt(bytes);
+
+  int p2 = 1;
+  while (p2 * 2 <= n) p2 <<= 1;
+  const int extra = n - p2;  // 0 < extra < p2 for non-power-of-two n
+
+  // Pre-step: pair the first 2*extra ranks. The odd member sends its data to
+  // the even member (which reduces it in) and drops out until the post-step.
+  int newRank;
+  if (r < 2 * extra) {
+    if (r & 1) {
+      VCCLCHECK(comm->transport->send(r - 1, recv, bytes));
+      newRank = -1;
+    } else {
+      VCCLCHECK(comm->transport->recv(r + 1, scratch, bytes));
+      VCCLCHECK(vccl::cpuReduce(dt, op, recv, scratch, count));
+      newRank = r / 2;
+    }
+  } else {
+    newRank = r - extra;
+  }
+
+  // Core: recursive doubling over the p2 active ranks (folded ranks skip it).
+  if (newRank >= 0) {
+    for (int mask = 1; mask < p2; mask <<= 1) {
+      const int newPeer = newRank ^ mask;
+      const int peer = (newPeer < extra) ? newPeer * 2 : newPeer + extra;
+      VCCLCHECK(comm->transport->sendRecv(peer, recv, bytes, peer, scratch,
+                                          bytes));
+      VCCLCHECK(vccl::cpuReduce(dt, op, recv, scratch, count));
+    }
+  }
+
+  // Post-step: even members send the full result back to their folded partner.
+  if (r < 2 * extra) {
+    if (r & 1)
+      VCCLCHECK(comm->transport->recv(r - 1, recv, bytes));
+    else
+      VCCLCHECK(comm->transport->send(r + 1, recv, bytes));
+  }
+  return vcclSuccess;
+}
+
 vcclResult_t doAllReduce(const void* sendbuff, void* recvbuff, size_t count,
                          vcclDataType_t datatype, vcclRedOp_t op, bool premul,
                          double scalar, vcclComm_t comm) {
@@ -351,7 +407,8 @@ vcclResult_t doAllReduce(const void* sendbuff, void* recvbuff, size_t count,
   // scatter+all-gather is bandwidth-optimal and wins for large.
   //   VCCL_ALLREDUCE_ALGO = ring | recdouble   force one (A/B benchmarking)
   //   VCCL_ALLREDUCE_RD_MAX = <bytes>          threshold (default 256 KiB)
-  // Recursive doubling needs power-of-two n; non-pow2 always uses the ring.
+  // Log path: plain recursive doubling for power-of-two n, power-of-two
+  // elimination (pre/post fold) for any other n. Ring above the threshold.
   const char* algo = std::getenv("VCCL_ALLREDUCE_ALGO");
   const bool forceRing = algo != nullptr && std::strcmp(algo, "ring") == 0;
   const bool forceRD = algo != nullptr && std::strcmp(algo, "recdouble") == 0;
@@ -361,8 +418,12 @@ vcclResult_t doAllReduce(const void* sendbuff, void* recvbuff, size_t count,
   const int n = comm->nranks;
   const bool pow2 = n > 1 && (n & (n - 1)) == 0;
   const size_t bytes = count * esize;
-  if (pow2 && !forceRing && (forceRD || bytes <= rdMax)) {
-    VCCLCHECK(recursiveDoublingAllReduce(comm, recv, count, datatype, op));
+  if (!forceRing && (forceRD || bytes <= rdMax)) {
+    if (pow2) {
+      VCCLCHECK(recursiveDoublingAllReduce(comm, recv, count, datatype, op));
+    } else {
+      VCCLCHECK(pow2ElimAllReduce(comm, recv, count, datatype, op));
+    }
     if (op == vcclAvg)
       VCCLCHECK(vccl::cpuScale(datatype, recv, count, 1.0 / n));
     return vcclSuccess;

@@ -175,6 +175,29 @@ void testAllReduce(vcclComm_t comm, int rank, int nranks, vcclDataType_t dt,
         "allreduce in-place mismatch");
 }
 
+void testAllReduceAlgoAB(vcclComm_t comm, int rank, int nranks, size_t count) {
+  // Force each all-reduce algorithm in turn on identical input. For non-pow2
+  // n this exercises the pow2-elimination path (recdouble) against the ring;
+  // both must match the straight-line reference within tolerance.
+  size_t esize = vcclTypeSize(vcclFloat32);
+  std::vector<char> send(count * esize), a(count * esize), b(count * esize);
+  fillBuffer(send.data(), vcclFloat32, rank, count, 0);
+  for (vcclRedOp_t op : {vcclSum, vcclMax}) {
+    setenv("VCCL_ALLREDUCE_ALGO", "ring", 1);
+    VCHECK(vcclAllReduce(send.data(), a.data(), count, vcclFloat32, op, comm));
+    setenv("VCCL_ALLREDUCE_ALGO", "recdouble", 1);
+    VCHECK(vcclAllReduce(send.data(), b.data(), count, vcclFloat32, op, comm));
+    unsetenv("VCCL_ALLREDUCE_ALGO");
+    for (size_t i = 0; i < count; i++) {
+      float ref = reduceRef(op, nranks, i);
+      expectNear(readValue(a.data(), vcclFloat32, i), ref, vcclFloat32,
+                 "AB ring", i);
+      expectNear(readValue(b.data(), vcclFloat32, i), ref, vcclFloat32,
+                 "AB recdouble", i);
+    }
+  }
+}
+
 void testBroadcast(vcclComm_t comm, int rank, int nranks, size_t count) {
   std::vector<float> buf(count);
   for (int root = 0; root < nranks; root++) {
@@ -475,6 +498,8 @@ int childMain(int rank, int nranks, const vcclUniqueId& id) {
   testPreMulSum(comm, rank, nranks, 512);
   testCommSplit(comm, rank, nranks);
   testMisc(comm, rank, nranks);
+  testAllReduceAlgoAB(comm, rank, nranks, 1000);
+  testAllReduceAlgoAB(comm, rank, nranks, 70000);  // forceRD path > rdMax
 
   VCHECK(vcclCommDestroy(comm));
   if (g_failures > 0) {
