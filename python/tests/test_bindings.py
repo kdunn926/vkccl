@@ -20,8 +20,26 @@ try:
 except ImportError:
     np = None
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 NRANKS = 3
 COUNT = 4099  # deliberately not divisible by NRANKS
+
+
+def _torch_guard_tests() -> None:
+    """M7: _buffer_info rejects strided / non-CPU torch tensors."""
+    if torch is None:
+        return
+    strided = torch.arange(20, dtype=torch.float32).reshape(4, 5)[:, ::2]
+    assert not strided.is_contiguous()
+    try:
+        vccl._buffer_info(strided, writable=False)
+        raise AssertionError("expected ValueError for a strided tensor")
+    except ValueError:
+        pass
 
 
 def child(rank: int, uid_hex: str, q: mp.Queue) -> None:
@@ -91,6 +109,7 @@ def _bytearray_tests(comm: vccl.Communicator, rank: int) -> None:
 
 
 def main() -> int:
+    _torch_guard_tests()
     os.environ.setdefault("VCCL_SOCKET_ADDR", "127.0.0.1")
     if not os.environ.get("VCCL_LIBRARY"):
         here = os.path.dirname(os.path.abspath(__file__))

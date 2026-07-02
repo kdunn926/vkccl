@@ -190,6 +190,14 @@ def _buffer_info(obj: Any, writable: bool) -> Tuple[int, int, Optional[DataType]
     # torch tensor (CPU)
     data_ptr = getattr(obj, "data_ptr", None)
     if callable(data_ptr):
+        is_contig = getattr(obj, "is_contiguous", None)
+        if callable(is_contig) and not obj.is_contiguous():
+            raise ValueError(
+                "vccl requires a contiguous tensor; call .contiguous() first")
+        dev = getattr(obj, "device", None)
+        if dev is not None and getattr(dev, "type", "cpu") != "cpu":
+            raise ValueError(
+                f"vccl operates on CPU tensors; got device '{dev}'")
         dtype_name = str(obj.dtype).replace("torch.", "")
         nbytes = obj.numel() * obj.element_size()
         return obj.data_ptr(), nbytes, _DTYPE_NAMES.get(dtype_name)
