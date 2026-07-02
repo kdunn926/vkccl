@@ -17,6 +17,17 @@ groups; vccl replaces the data-plane collectives).
 
 The module also works without vLLM installed — `VcclCommunicator` then
 derives from a minimal standalone base, which is how the unit tests run.
+
+Pre-registration pattern (H1): decode collective *shapes* are stable even
+though the caching-allocator activation tensor's address is not, so this
+communicator keeps a persistent, `vcclCommRegister`-ed staging buffer per
+`(role, shape, dtype)` and runs each collective on it (copying the volatile
+activation in/out). This is what removes the per-token `ibv_reg_mr` from the
+RDMA hot path. Non-Python consumers that call the C collectives directly
+(e.g. the vllm-vulkan Rust FFI via `model.set_collective_comm(comm.handle)`)
+should follow the same recipe: allocate one fixed scratch buffer per decode
+shape, call `vcclCommRegister(comm, ptr, bytes, &handle)` once at setup, and
+copy activations through that buffer instead of registering per call.
 """
 
 from __future__ import annotations
@@ -93,18 +104,38 @@ class VcclCommunicator(DeviceCommunicatorBase):
                 torch.frombuffer(bytearray(bytes(uid.internal)),
                                  dtype=torch.uint8))
         dist.broadcast(uid_tensor, src=self.ranks[0], group=self.cpu_group)
-        uid = vccl.UniqueId.from_bytes(bytes(uid_tensor.tolist()))
+        uid = vccl.UniqueId.from_bytes(bytes(uid_tensor.numpy()))
         self._comm = vccl.Communicator(self.world_size, uid,
                                        self.rank_in_group)
+        # (role, shape, dtype) -> (persistent tensor, vcclCommRegister handle).
+        # M8: removes the per-call output allocation on the decode hot path.
+        # H1(b): because the tensor is vcclCommRegister-ed, ScopedReg::add's
+        # covers() check short-circuits on it, so a collective run on it does
+        # zero ibv_reg_mr/ibv_dereg_mr (vs. ~10-50us/call on the volatile
+        # activation tensor, whose address is not stable enough to register).
+        # Decode shapes are few and stable, so this dict stays small; each
+        # distinct (role, shape, dtype) seen holds one buffer for the life of
+        # the communicator.
+        self._buffers: dict = {}
+
+    def _buf(self, role: str, shape, dtype: torch.dtype) -> torch.Tensor:
+        key = (role, tuple(shape), dtype)
+        got = self._buffers.get(key)
+        if got is None:
+            t = torch.empty(shape, dtype=dtype, device=self.device).contiguous()
+            handle = self._comm.register(t)
+            got = (t, handle)
+            self._buffers[key] = got
+        return got[0]
 
     # ── collectives ──────────────────────────────────────────────────────
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
             return input_
-        t = input_ if input_.is_contiguous() else input_.contiguous()
-        self._comm.all_reduce(t, count=t.numel(), dtype=_vccl_dtype(t))
-        if t is not input_:
-            input_.copy_(t)
+        buf = self._buf("ar", input_.shape, input_.dtype)
+        buf.copy_(input_)
+        self._comm.all_reduce(buf, count=buf.numel(), dtype=_vccl_dtype(buf))
+        input_.copy_(buf)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -113,9 +144,10 @@ class VcclCommunicator(DeviceCommunicatorBase):
         if dim < 0:
             dim += input_.dim()
         input_size = input_.size()
-        t = input_.contiguous()
-        output = torch.empty((self.world_size,) + tuple(input_size),
-                             dtype=t.dtype, device=t.device)
+        t = self._buf("ag_in", input_size, input_.dtype)
+        t.copy_(input_)
+        output = self._buf("ag_out", (self.world_size,) + tuple(input_size),
+                           input_.dtype)
         self._comm.all_gather(t, output, sendcount=t.numel(),
                               dtype=_vccl_dtype(t))
         output = output.movedim(0, dim)
@@ -132,12 +164,13 @@ class VcclCommunicator(DeviceCommunicatorBase):
         assert -input_.dim() <= dim < input_.dim()
         if dim < 0:
             dim += input_.dim()
-        input_tensor = input_.movedim(0, dim).contiguous()
+        moved = input_.movedim(0, dim)
+        input_tensor = self._buf("rs_in", moved.shape, input_.dtype)
+        input_tensor.copy_(moved)
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
-        output_tensor = torch.empty(output_shape, dtype=input_tensor.dtype,
-                                    device=input_tensor.device)
+        output_tensor = self._buf("rs_out", output_shape, input_tensor.dtype)
         self._comm.reduce_scatter(input_tensor, output_tensor,
                                   recvcount=output_tensor.numel(),
                                   dtype=_vccl_dtype(input_tensor))
@@ -170,5 +203,8 @@ class VcclCommunicator(DeviceCommunicatorBase):
 
     def destroy(self) -> None:
         if getattr(self, "_comm", None) is not None:
+            for _t, handle in self._buffers.values():
+                self._comm.deregister(handle)
+            self._buffers = {}
             self._comm.destroy()
             self._comm = None

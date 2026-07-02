@@ -45,6 +45,15 @@ def child(rank: int, port: int, q: mp.Queue) -> None:
         out = comm.all_reduce(x.clone())
         assert torch.allclose(out, ref, atol=1e-5), "all_reduce vs gloo"
 
+        # M8/H1(b): repeat calls on the same shape reuse one registered
+        # buffer instead of allocating/registering per call.
+        ptr_before = comm._buf("ar", x.shape, x.dtype).data_ptr()
+        comm.all_reduce(x.clone())
+        comm.all_reduce(x.clone())
+        assert len(comm._buffers) == 1, "expected a single cached ar buffer"
+        assert comm._buf("ar", x.shape, x.dtype).data_ptr() == ptr_before, \
+            "expected the cached buffer's address to be stable across calls"
+
         # all_reduce bf16
         xb = torch.randn(257, dtype=torch.bfloat16)
         refb = xb.clone().float()
