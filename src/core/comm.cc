@@ -166,6 +166,7 @@ vcclResult_t vcclCommGetAsyncError(vcclComm_t comm,
 vcclResult_t vcclCommDestroy(vcclComm_t comm) {
   if (comm != nullptr) {
     std::lock_guard<std::mutex> lock(comm->regMutex);
+    comm->flushMrCache();  // H1: no stale MR outlives the comm/transport
     for (vcclComm::MemReg* reg : comm->registrations) {
       if (comm->transport) comm->transport->deregMr(reg->transportHandle);
       if (reg->mapped != nullptr) munmap(reg->mapped, reg->bytes);
@@ -231,6 +232,10 @@ vcclResult_t vcclCommDeregister(vcclComm_t comm, vcclMemHandle_t handle) {
   auto it = std::find(comm->registrations.begin(), comm->registrations.end(),
                       reg);
   if (it == comm->registrations.end()) return vcclInvalidArgument;
+  // H1: a deregistered/freed range must never be left pinned in the MR
+  // cache; flush the whole (small, bounded) cache rather than tracking
+  // per-range overlap with cached entries.
+  comm->flushMrCache();
   comm->registrations.erase(it);
   if (comm->transport) comm->transport->deregMr(reg->transportHandle);
   if (reg->mapped != nullptr) munmap(reg->mapped, reg->bytes);

@@ -3,6 +3,8 @@
 #define VCCL_CORE_COMM_H_
 
 #include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -69,6 +71,72 @@ struct vcclComm {
     return scratch.data();
   }
 
+  // ── H1: transient MR cache ────────────────────────────────────────────
+  // ScopedReg pins the user buffer for one collective. On RDMA ibv_reg_mr is
+  // ~10-50us (comparable to the wire RTT) and the decode loop re-pins the SAME
+  // stable tensors every token. This bounded LRU keeps a few most-recent
+  // (addr,len) MRs alive so a repeat collective reuses one instead of pinning.
+  // SAFETY: only EXACT (addr,len) repeats hit; the whole cache is flushed on
+  // any user deregistration/free (flushMrCache) so a freed+remapped range can
+  // never leave the NIC pinned to stale pages. VCCL_MR_CACHE=0 disables it;
+  // default OFF until validated on the RDMA cluster (Phase 2 flips to 16). TCP
+  // regMr yields a null handle, so the cache is naturally inert there.
+  struct MrCacheEntry {
+    uintptr_t addr = 0;
+    size_t len = 0;
+    void* handle = nullptr;   // transport MR handle
+    uint64_t seq = 0;         // LRU recency stamp
+  };
+  std::vector<MrCacheEntry> mrCache;
+  uint64_t mrClock = 0;
+
+  int mrCacheCap() {
+    static int cap = [] {
+      const char* e = std::getenv("VCCL_MR_CACHE");
+      if (e == nullptr) return 0;      // DEFAULT OFF (Phase 2: return 16)
+      if (e[0] == '0' && e[1] == '\0') return 0;
+      int v = atoi(e);
+      return v > 0 ? v : 16;           // "1"/non-numeric -> default capacity
+    }();
+    return cap;
+  }
+
+  // Exact (addr,len) hit: bump recency, return the handle via *out.
+  bool mrCacheGet(uintptr_t addr, size_t len, void** out) {
+    for (auto& e : mrCache) {
+      if (e.addr == addr && e.len == len) {
+        e.seq = ++mrClock;
+        *out = e.handle;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Insert a freshly-registered handle, evicting (and deregistering) the LRU
+  // entry when at capacity.
+  void mrCachePut(uintptr_t addr, size_t len, void* handle) {
+    const int cap = mrCacheCap();
+    if (cap <= 0 || handle == nullptr) return;   // disabled / nothing to cache
+    if (static_cast<int>(mrCache.size()) >= cap) {
+      size_t victim = 0;
+      for (size_t i = 1; i < mrCache.size(); i++)
+        if (mrCache[i].seq < mrCache[victim].seq) victim = i;
+      if (transport && mrCache[victim].handle)
+        transport->deregMr(mrCache[victim].handle);
+      mrCache.erase(mrCache.begin() + victim);
+    }
+    mrCache.push_back({addr, len, handle, ++mrClock});
+  }
+
+  // Deregister and drop every cached MR. Called on ANY user deregistration or
+  // free and on comm destroy so no stale (freed) range stays pinned.
+  void flushMrCache() {
+    for (auto& e : mrCache)
+      if (transport && e.handle) transport->deregMr(e.handle);
+    mrCache.clear();
+  }
+
   // PreMulSum scalar for `op`, or 0 if op is not a valid custom op.
   bool premulScalar(vcclRedOp_t op, double* scalar) const {
     size_t idx = static_cast<size_t>(op) - vcclNumOps;
@@ -128,6 +196,18 @@ class ScopedReg {
     // Already inside a user/dmabuf registration: pinning again would be
     // wasted work, and dmabuf mappings cannot be pinned at all.
     if (comm_->transport->covers(ptr, bytes)) return vcclSuccess;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(ptr);
+    if (comm_->mrCacheCap() > 0) {
+      void* cached = nullptr;
+      if (comm_->mrCacheGet(a, bytes, &cached)) return vcclSuccess;  // reuse
+      void* handle = nullptr;
+      vcclResult_t res =
+          comm_->transport->regMr(const_cast<void*>(ptr), bytes, &handle);
+      if (res != vcclSuccess) return res;
+      comm_->mrCachePut(a, bytes, handle);  // cache owns it; NOT added to handles_
+      return vcclSuccess;
+    }
+    // Cache disabled: original behavior — pin now, dereg at ScopedReg dtor.
     void* handle = nullptr;
     vcclResult_t res =
         comm_->transport->regMr(const_cast<void*>(ptr), bytes, &handle);
