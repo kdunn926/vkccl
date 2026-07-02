@@ -52,6 +52,40 @@ void SocketAddr::setPort(uint16_t port) {
     reinterpret_cast<sockaddr_in6*>(&storage)->sin6_port = htons(port);
 }
 
+WireAddr toWire(const SocketAddr& sa) {
+  WireAddr w{};
+  if (sa.storage.ss_family == AF_INET) {
+    const auto* in = reinterpret_cast<const sockaddr_in*>(&sa.storage);
+    w.family = kWireFamilyIPv4;
+    w.port = in->sin_port;
+    memcpy(w.addr, &in->sin_addr, 4);
+  } else {
+    const auto* in6 = reinterpret_cast<const sockaddr_in6*>(&sa.storage);
+    w.family = kWireFamilyIPv6;
+    w.port = in6->sin6_port;
+    memcpy(w.addr, &in6->sin6_addr, 16);
+  }
+  return w;
+}
+
+SocketAddr fromWire(const WireAddr& w) {
+  SocketAddr sa;
+  if (w.family == kWireFamilyIPv4) {
+    auto* in = reinterpret_cast<sockaddr_in*>(&sa.storage);
+    in->sin_family = AF_INET;
+    in->sin_port = w.port;
+    memcpy(&in->sin_addr, w.addr, 4);
+    sa.len = sizeof(sockaddr_in);
+  } else {
+    auto* in6 = reinterpret_cast<sockaddr_in6*>(&sa.storage);
+    in6->sin6_family = AF_INET6;
+    in6->sin6_port = w.port;
+    memcpy(&in6->sin6_addr, w.addr, 16);
+    sa.len = sizeof(sockaddr_in6);
+  }
+  return sa;
+}
+
 vcclResult_t getAdvertisedAddr(SocketAddr* addr) {
   memset(&addr->storage, 0, sizeof(addr->storage));
 

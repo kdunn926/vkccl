@@ -35,14 +35,20 @@ class TcpTransport final : public Transport {
     uint16_t port = 0;
     VCCLCHECK(createListenSocket(&listenFd, 0, &port));
 
-    std::vector<SocketAddr> addrs(nranks);
-    VCCLCHECK(getAdvertisedAddr(&addrs[rank]));
-    addrs[rank].setPort(port);
-    vcclResult_t res = bs->allGather(addrs.data(), sizeof(SocketAddr));
+    SocketAddr myAddr;
+    VCCLCHECK(getAdvertisedAddr(&myAddr));
+    myAddr.setPort(port);
+    // M11: exchange the portable, packed WireAddr (not the raw, non-portable
+    // sockaddr_storage) so mixed-OS/arch peers agree on the wire layout.
+    std::vector<WireAddr> wireAddrs(nranks);
+    wireAddrs[rank] = toWire(myAddr);
+    vcclResult_t res = bs->allGather(wireAddrs.data(), sizeof(WireAddr));
     if (res != vcclSuccess) {
       closeQuiet(listenFd);
       return res;
     }
+    std::vector<SocketAddr> addrs(nranks);
+    for (int i = 0; i < nranks; i++) addrs[i] = fromWire(wireAddrs[i]);
 
     for (int peer = 0; peer < rank; peer++) {
       int fd = -1;

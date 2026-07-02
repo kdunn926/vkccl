@@ -35,6 +35,25 @@ struct SocketAddr {
   void setPort(uint16_t port);
 };
 
+// M11: portable, packed wire form of a SocketAddr for cross-node exchange.
+// sockaddr_storage (128 B) is non-portable on the wire: ss_family's offset
+// and width vary by OS/arch and the struct has trailing padding. WireAddr
+// uses fixed wire family codes (NOT the host AF_INET/AF_INET6 values, which
+// also differ across OSes) plus the same compact addr[16] layout
+// UniqueIdInternal already uses, so there is one wire address format.
+constexpr uint16_t kWireFamilyIPv4 = 1;
+constexpr uint16_t kWireFamilyIPv6 = 2;
+
+struct WireAddr {
+  uint16_t family;   // kWireFamilyIPv4 / kWireFamilyIPv6
+  uint16_t port;     // network byte order
+  uint8_t addr[16];  // v4 in the first 4 bytes, else v6
+};
+static_assert(sizeof(WireAddr) == 20, "WireAddr must be packed");
+
+WireAddr toWire(const SocketAddr& sa);
+SocketAddr fromWire(const WireAddr& w);
+
 // Pick the local IP to advertise to peers: VCCL_SOCKET_ADDR if set, else the
 // address of VCCL_SOCKET_IFNAME, else the first non-loopback interface, else
 // loopback. Port is left as 0.

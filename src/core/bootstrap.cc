@@ -30,9 +30,23 @@ struct Hello {
   uint32_t version;  // VCCL_VERSION_CODE
   int32_t  nranks;
   int32_t  rank;
-  int32_t  pad;      // explicit, kept zero on the wire (M11: no uninit padding)
+  int32_t  pad;      // M11: low byte carries the sender's endianness marker
+                     // (kWireLittleEndian); rest kept zero on the wire.
 };
 static_assert(sizeof(Hello) == 32, "Hello must have no implicit padding");
+
+// M11: a 1-byte endianness marker folded into Hello.pad (no struct size
+// change, still static_assert(sizeof(Hello)==32)). The BC-250 cluster is
+// homogeneous little-endian, so this is a no-op on the wire there; it closes
+// the mixed-endian Mac-dev / Linux-cluster hole the review names by having
+// root reject a mismatched rank cleanly via the existing accept/reject reply.
+constexpr int32_t kWireLittleEndian = 1;
+
+int32_t hostEndiannessMarker() {
+  const uint16_t probe = 1;
+  return (*reinterpret_cast<const uint8_t*>(&probe) == 1) ? kWireLittleEndian
+                                                            : 0;
+}
 
 }  // namespace
 
@@ -183,13 +197,16 @@ vcclResult_t Bootstrap::init(const vcclUniqueId& id, int rank, int nranks,
           hello.salt == internal->salt &&
           hello.version == static_cast<uint32_t>(VCCL_VERSION_CODE) &&
           hello.nranks == nranks && hello.rank > 0 && hello.rank < nranks &&
-          bs->peerFds_[hello.rank] == -1;
+          bs->peerFds_[hello.rank] == -1 &&
+          hello.pad == hostEndiannessMarker();
       // Reply accept(1)/reject(0) so a wrong-job client fails fast instead of
       // hanging in sendAll/recvAll. Best-effort on the reject path.
       uint8_t reply = ok ? 1 : 0;
       sendAll(fd, &reply, sizeof(reply));
       if (!ok) {
-        VCCL_ERR("bootstrap: rejected hello (magic/salt/version/nranks/rank)");
+        VCCL_ERR(
+            "bootstrap: rejected hello (magic/salt/version/nranks/rank/"
+            "endianness)");
         closeQuiet(fd);
         closeQuiet(listenFd);
         return res != vcclSuccess ? res : vcclInvalidUsage;
@@ -205,6 +222,7 @@ vcclResult_t Bootstrap::init(const vcclUniqueId& id, int rank, int nranks,
     hello.version = static_cast<uint32_t>(VCCL_VERSION_CODE);
     hello.nranks = nranks;
     hello.rank = rank;
+    hello.pad = hostEndiannessMarker();
     VCCLCHECK(sendAll(bs->rootFd_, &hello, sizeof(hello)));
     uint8_t reply = 0;
     VCCLCHECK(recvAll(bs->rootFd_, &reply, sizeof(reply)));
