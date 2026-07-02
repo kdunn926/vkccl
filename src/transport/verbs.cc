@@ -64,7 +64,7 @@ struct Prof {
   }
 };
 inline Prof& prof() {
-  static Prof p = [] {
+  static thread_local Prof p = [] {
     Prof q;
     const char* e = std::getenv("VCCL_PROF");
     q.on = e != nullptr && e[0] == '1';
@@ -366,22 +366,29 @@ class VerbsTransport final : public Transport {
 
   vcclResult_t send(int peer, const void* buf, size_t bytes) override {
     if (bytes == 0) return vcclSuccess;
+    DrainGuard guard{this};
     int wrs = 0;
     VCCLCHECK(postSend(peer, buf, bytes, &wrs));
-    return pollPeer(peer, wrs, 0);
+    VCCLCHECK(pollPeer(peer, wrs, 0));
+    drainCompleted();          // M4: release the temp MR now, not later
+    guard.committed = true;
+    return vcclSuccess;
   }
 
   vcclResult_t recv(int peer, void* buf, size_t bytes) override {
     if (bytes == 0) return vcclSuccess;
+    DrainGuard guard{this};
     int wrs = 0;
     VCCLCHECK(postRecv(peer, buf, bytes, &wrs));
     VCCLCHECK(pollPeer(peer, 0, wrs));
     drainCompleted();
+    guard.committed = true;
     return vcclSuccess;
   }
 
   vcclResult_t sendRecv(int sendPeer, const void* sbuf, size_t sbytes,
                         int recvPeer, void* rbuf, size_t rbytes) override {
+    DrainGuard guard{this};
     Prof& pf = prof();
     double t0 = pf.on ? Prof::now_us() : 0;
     int sendWrs = 0, recvWrs = 0;
@@ -413,10 +420,12 @@ class VerbsTransport final : public Transport {
       }
     }
     drainCompleted();
+    guard.committed = true;
     return vcclSuccess;
   }
 
   vcclResult_t batch(const std::vector<P2pOp>& ops) override {
+    DrainGuard guard{this};
     // Post in waves so no QP exceeds its work-queue depth, polling each
     // wave to completion. Within a wave, all transfers progress together
     // (RC QPs are independent; send/recv on one QP are independent queues).
@@ -478,6 +487,7 @@ class VerbsTransport final : public Transport {
       drainCompleted();
       idx = waveEnd;
     }
+    guard.committed = true;
     return vcclSuccess;
   }
 
@@ -719,6 +729,20 @@ class VerbsTransport final : public Transport {
     for (ibv_mr* mr : tempMrs_) ibv_dereg_mr(mr);
     tempMrs_.clear();
   }
+
+  // Drop staged copybacks WITHOUT flushing (the transfer failed, staging holds
+  // garbage) and release temp MRs. Used on any error return so the next op is
+  // clean (M1).
+  void discardPending() {
+    pendingCopyback_.clear();
+    for (ibv_mr* mr : tempMrs_) ibv_dereg_mr(mr);
+    tempMrs_.clear();
+  }
+  struct DrainGuard {
+    VerbsTransport* t;
+    bool committed = false;
+    ~DrainGuard() { if (!committed) t->discardPending(); }
+  };
 
   vcclResult_t pollOnce(int peer, int* sendDone, int* recvDone) {
     ibv_wc wc[16];
