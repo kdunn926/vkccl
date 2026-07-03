@@ -127,6 +127,15 @@ vcclResult_t ringAllGather(vcclComm_t comm, char* data,
                            const std::vector<Chunk>& chunks, int startShift) {
   const int n = comm->nranks;
   const int r = comm->rank;
+  // M5: pre-post every step's recv (distinct chunk offsets, all from prev()).
+  {
+    std::vector<vccl::Transport::RecvReq> reqs;
+    for (int s = 0; s < n - 1; s++) {
+      const Chunk& rc = chunks[(r + startShift - s - 1 + 2 * n) % n];
+      reqs.push_back({comm->prev(), data + rc.offset, rc.bytes});
+    }
+    VCCLCHECK(comm->transport->postRecvs(reqs));
+  }
   for (int s = 0; s < n - 1; s++) {
     const Chunk& sc = chunks[(r + startShift - s + 2 * n) % n];
     const Chunk& rc = chunks[(r + startShift - s - 1 + 2 * n) % n];
@@ -147,6 +156,19 @@ vcclResult_t recursiveDoublingAllGather(vcclComm_t comm, char* data,
                                         size_t chunkBytes) {
   const int n = comm->nranks;
   const int r = comm->rank;
+  // M5: pre-post every step's recv (distinct, contiguous, doubling blocks).
+  {
+    std::vector<vccl::Transport::RecvReq> reqs;
+    size_t curr = chunkBytes;
+    int i = 0;
+    for (int mask = 1; mask < n; mask <<= 1, ++i) {
+      const int dst = r ^ mask;
+      const size_t recvOff = static_cast<size_t>((dst >> i) << i) * chunkBytes;
+      reqs.push_back({dst, data + recvOff, curr});
+      curr *= 2;
+    }
+    VCCLCHECK(comm->transport->postRecvs(reqs));
+  }
   size_t curr = chunkBytes;  // bytes I currently hold (one contiguous block)
   int i = 0;
   for (int mask = 1; mask < n; mask <<= 1, ++i) {
@@ -174,6 +196,22 @@ vcclResult_t bruckAllGather(vcclComm_t comm, char* recv, size_t chunkBytes) {
   // Bruck accumulates from slot 0; doAllGather placed our block at slot rank.
   if (rank != 0)
     memcpy(recv, recv + static_cast<size_t>(rank) * chunkBytes, chunkBytes);
+
+  // M5: pre-post every step's recv (same curr/xfer recurrence as the loop
+  // below, computed here without mutating the real `curr` used by the loop).
+  {
+    std::vector<vccl::Transport::RecvReq> reqs;
+    size_t pcurr = chunkBytes;
+    for (int pof2 = 1; pof2 < n; pof2 <<= 1) {
+      const int src = (rank + pof2) % n;
+      const size_t xfer = (pof2 <= n - pof2)
+                              ? pcurr
+                              : static_cast<size_t>(n - pof2) * chunkBytes;
+      reqs.push_back({src, recv + pcurr, xfer});
+      pcurr += xfer;
+    }
+    VCCLCHECK(comm->transport->postRecvs(reqs));
+  }
 
   size_t curr = chunkBytes;  // bytes accumulated at recv[0..curr)
   for (int pof2 = 1; pof2 < n; pof2 <<= 1) {

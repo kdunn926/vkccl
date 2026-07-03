@@ -41,6 +41,21 @@ class Transport {
   // in issue order.
   virtual vcclResult_t batch(const std::vector<P2pOp>& ops) = 0;
 
+  // One receive to pre-post (M5). Buffer must stay valid until the matching
+  // sendRecv/recv consumes it.
+  struct RecvReq { int peer; void* buf; size_t bytes; };
+
+  // Pre-post every recv of a multi-step collective up front. On RDMA this
+  // lifts the per-step recv-post off the critical path and makes the path
+  // structurally RNR-free; the subsequent sendRecv for the same (peer,buf,
+  // bytes) skips its own post and just waits. Default (and TCP): no-op hint;
+  // sendRecv is unchanged, so there is no send/send deadlock. reqs must list
+  // the recvs in the order the collective will issue its sendRecv recvs.
+  virtual vcclResult_t postRecvs(const std::vector<RecvReq>& reqs) {
+    (void)reqs;
+    return vcclSuccess;
+  }
+
   // Make any blocked operation fail promptly (vcclCommAbort). Thread-safe.
   virtual void abort() { aborted_.store(true, std::memory_order_relaxed); }
   bool isAborted() const { return aborted_.load(std::memory_order_relaxed); }

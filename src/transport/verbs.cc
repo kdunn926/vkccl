@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <list>
 #include <map>
 #include <memory>
@@ -246,6 +247,7 @@ class VerbsTransport final : public Transport {
     t->cqs_.assign(nranks, nullptr);
     t->qps_.assign(nranks, nullptr);
     t->maxInline_.assign(nranks, 0);
+    t->prePostedRecv_.assign(nranks, {});
 
     std::mt19937 rng(std::random_device{}());
     std::vector<QpInfo> local(nranks);
@@ -392,7 +394,17 @@ class VerbsTransport final : public Transport {
     Prof& pf = prof();
     double t0 = pf.on ? Prof::now_us() : 0;
     int sendWrs = 0, recvWrs = 0;
-    if (rbytes > 0) VCCLCHECK(postRecv(recvPeer, rbuf, rbytes, &recvWrs));
+    if (rbytes > 0) {
+      // If this recv was pre-posted (M5), its WQE is already on the queue —
+      // just take its WR count and wait for it below. Order matches: recvs are
+      // pre-posted in the same step order the collective issues sendRecv.
+      if (!prePostedRecv_[recvPeer].empty()) {
+        recvWrs = prePostedRecv_[recvPeer].front();
+        prePostedRecv_[recvPeer].pop_front();
+      } else {
+        VCCLCHECK(postRecv(recvPeer, rbuf, rbytes, &recvWrs));
+      }
+    }
     if (sbytes > 0) VCCLCHECK(postSend(sendPeer, sbuf, sbytes, &sendWrs));
     double t1 = pf.on ? Prof::now_us() : 0;
     if (sendPeer == recvPeer) {
@@ -486,6 +498,18 @@ class VerbsTransport final : public Transport {
       }
       drainCompleted();
       idx = waveEnd;
+    }
+    guard.committed = true;
+    return vcclSuccess;
+  }
+
+  vcclResult_t postRecvs(const std::vector<RecvReq>& reqs) override {
+    DrainGuard guard{this};
+    for (const RecvReq& r : reqs) {
+      if (r.bytes == 0) continue;
+      int wrs = 0;
+      VCCLCHECK(postRecv(r.peer, r.buf, r.bytes, &wrs));
+      prePostedRecv_[r.peer].push_back(wrs);
     }
     guard.committed = true;
     return vcclSuccess;
@@ -800,6 +824,7 @@ class VerbsTransport final : public Transport {
   std::vector<ibv_cq*> cqs_;
   std::vector<ibv_qp*> qps_;
   std::vector<uint32_t> maxInline_;
+  std::vector<std::deque<int>> prePostedRecv_;  // sized nranks; per-peer recv WR counts
   // Persistent registrations (vcclCommRegister / dmabuf imports). std::list:
   // Region addresses are handed out as handles and must stay stable.
   std::list<Region> regions_;
