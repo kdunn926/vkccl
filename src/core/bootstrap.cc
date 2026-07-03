@@ -183,10 +183,13 @@ vcclResult_t Bootstrap::init(const vcclUniqueId& id, int rank, int nranks,
       return vcclInvalidUsage;
     }
     bs->peerFds_.assign(nranks, -1);
-    for (int i = 0; i < nranks - 1; i++) {
+    int connected = 0;
+    while (connected < nranks - 1) {
       int fd = -1;
       vcclResult_t res = acceptOne(listenFd, &fd);
       if (res != vcclSuccess) {
+        // accept() itself failed: the listen socket is unusable, not a single
+        // client's fault. Stay fatal.
         closeQuiet(listenFd);
         return res;
       }
@@ -204,14 +207,19 @@ vcclResult_t Bootstrap::init(const vcclUniqueId& id, int rank, int nranks,
       uint8_t reply = ok ? 1 : 0;
       sendAll(fd, &reply, sizeof(reply));
       if (!ok) {
+        // Reject THIS client only and keep listening: a stray/wrong-nranks
+        // client (or one that dropped mid-Hello) must not abort a legitimate
+        // forming job. A genuinely missing rank instead surfaces via its own
+        // connect/collective timeout, not a hard abort here.
         VCCL_ERR(
-            "bootstrap: rejected hello (magic/salt/version/nranks/rank/"
-            "endianness)");
+            "bootstrap: rejected a client (magic/salt/version/nranks/rank/"
+            "endianness or recv error); still listening for %d more peer(s)",
+            nranks - 1 - connected);
         closeQuiet(fd);
-        closeQuiet(listenFd);
-        return res != vcclSuccess ? res : vcclInvalidUsage;
+        continue;
       }
       bs->peerFds_[hello.rank] = fd;
+      connected++;
     }
     closeQuiet(listenFd);
   } else {

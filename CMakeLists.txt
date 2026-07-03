@@ -96,6 +96,11 @@ if(VCCL_BUILD_TESTS)
   add_test(NAME mrcache COMMAND test_mrcache)
   set_tests_properties(mrcache PROPERTIES TIMEOUT 60)
 
+  add_executable(test_bootstrap tests/test_bootstrap.cc)
+  target_link_libraries(test_bootstrap PRIVATE vccl_static Threads::Threads)
+  target_include_directories(test_bootstrap PRIVATE include src)
+  add_test(NAME bootstrap COMMAND test_bootstrap)
+
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_dmabuf tests/test_dmabuf.cc)
     target_link_libraries(test_dmabuf PRIVATE vccl_static Threads::Threads)
