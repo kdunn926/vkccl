@@ -24,6 +24,9 @@
  */
 #include <infiniband/verbs.h>
 
+#include <fcntl.h>
+#include <poll.h>
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -226,6 +229,8 @@ vcclResult_t openDevice(Device* dev) {
       dev->ctx = nullptr;
       continue;
     }
+    // H2: non-blocking async-event fd so drainAsyncFatal never blocks.
+    fcntl(dev->ctx->async_fd, F_SETFL, O_NONBLOCK);
     VCCL_INFO("verbs: using %s port %u (%s, gid index %d)", name, dev->port,
               dev->roce ? "RoCE" : "IB", dev->gidIndex);
     result = vcclSuccess;
@@ -425,6 +430,7 @@ class VerbsTransport final : public Transport {
           VCCLCHECK(pollOnce(sendPeer, &sendDone, nullptr));
         if (recvDone < recvWrs)
           VCCLCHECK(pollOnce(recvPeer, nullptr, &recvDone));
+        if (drainAsyncFatal()) return vcclRemoteError;
         if (deadline.expired()) {
           VCCL_ERR("sendRecv completion wait timed out (VCCL_TIMEOUT)");
           return vcclSystemError;
@@ -490,6 +496,10 @@ class VerbsTransport final : public Transport {
         if (isAborted()) {
           VCCL_ERR("batch aborted");
           return vcclSystemError;
+        }
+        if (drainAsyncFatal()) {
+          VCCL_ERR("batch failed: QP/device fatal async event");
+          return vcclRemoteError;
         }
         if (pending && deadline.expired()) {
           VCCL_ERR("batch completion wait timed out (VCCL_TIMEOUT)");
@@ -811,6 +821,10 @@ class VerbsTransport final : public Transport {
         VCCL_ERR("operation aborted (peer %d)", peer);
         return vcclSystemError;
       }
+      if (drainAsyncFatal()) {
+        VCCL_ERR("operation failed: QP/device fatal async event (peer %d)", peer);
+        return vcclRemoteError;
+      }
       if (deadline.expired()) {
         VCCL_ERR("completion wait timed out (peer %d, VCCL_TIMEOUT)", peer);
         return vcclSystemError;
@@ -819,12 +833,33 @@ class VerbsTransport final : public Transport {
     return vcclSuccess;
   }
 
+  // H2: cheap non-blocking drain of fatal async events. A QP/device/port fatal
+  // event makes ctx->async_fd readable; latch asyncFatal_ so the completion
+  // loops bail immediately (vcclRemoteError -> comm aborts via M3) instead of
+  // waiting out VCCL_TIMEOUT. One poll(fd,0) per spin — negligible.
+  bool drainAsyncFatal() {
+    pollfd pfd{dev_.ctx->async_fd, POLLIN, 0};
+    while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+      ibv_async_event ev;
+      if (ibv_get_async_event(dev_.ctx, &ev) != 0) break;
+      ibv_event_type t = ev.event_type;
+      ibv_ack_async_event(&ev);
+      if (t == IBV_EVENT_QP_FATAL || t == IBV_EVENT_QP_ACCESS_ERR ||
+          t == IBV_EVENT_PORT_ERR || t == IBV_EVENT_DEVICE_FATAL) {
+        VCCL_ERR("verbs async fatal event: %s", ibv_event_type_str(t));
+        asyncFatal_.store(true, std::memory_order_relaxed);
+      }
+    }
+    return asyncFatal_.load(std::memory_order_relaxed);
+  }
+
   Device dev_;
   int rank_ = -1;
   std::vector<ibv_cq*> cqs_;
   std::vector<ibv_qp*> qps_;
   std::vector<uint32_t> maxInline_;
   std::vector<std::deque<int>> prePostedRecv_;  // sized nranks; per-peer recv WR counts
+  std::atomic<bool> asyncFatal_{false};
   // Persistent registrations (vcclCommRegister / dmabuf imports). std::list:
   // Region addresses are handed out as handles and must stay stable.
   std::list<Region> regions_;
