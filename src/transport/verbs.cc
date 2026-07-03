@@ -24,6 +24,7 @@
  */
 #include <infiniband/verbs.h>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <poll.h>
 
@@ -100,6 +101,16 @@ struct QpInfo {
   uint8_t pad;
   uint8_t gid[16];
 };
+static_assert(sizeof(QpInfo) == 28, "QpInfo must be packed to 28 bytes");
+
+// M11: byte-swap the scalar fields in place so the wire is endian-neutral.
+// gid[]/mtu/pad are single bytes. hton and ntoh are the same swap, so one
+// function serves both directions.
+inline void qpInfoSwap(QpInfo& q) {
+  q.qpn = htonl(q.qpn);
+  q.psn = htonl(q.psn);
+  q.lid = htons(q.lid);
+}
 
 struct Device {
   ibv_context* ctx = nullptr;
@@ -269,9 +280,14 @@ class VerbsTransport final : public Transport {
 
     // all[r*nranks + p] is rank r's QP info for talking to p.
     std::vector<QpInfo> all(static_cast<size_t>(nranks) * nranks);
+    // M11: exchange endian-neutral; swap our row to wire order, allGather,
+    // then swap the whole buffer back to host order for connectQp.
+    for (int p = 0; p < nranks; p++)
+      if (p != rank) qpInfoSwap(local[p]);
     memcpy(&all[static_cast<size_t>(rank) * nranks], local.data(),
            sizeof(QpInfo) * nranks);
     VCCLCHECK(bs->allGather(all.data(), sizeof(QpInfo) * nranks));
+    for (auto& q : all) qpInfoSwap(q);
 
     for (int p = 0; p < nranks; p++) {
       if (p == rank) continue;
