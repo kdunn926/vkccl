@@ -79,8 +79,9 @@ struct vcclComm {
   // SAFETY: only EXACT (addr,len) repeats hit; the whole cache is flushed on
   // any user deregistration/free (flushMrCache) so a freed+remapped range can
   // never leave the NIC pinned to stale pages. VCCL_MR_CACHE=0 disables it;
-  // default OFF until validated on the RDMA cluster (Phase 2 flips to 16). TCP
-  // regMr yields a null handle, so the cache is naturally inert there.
+  // default ON (16); measured 6.8x on the BC-250 cluster (1KB all_reduce).
+  // VCCL_MR_CACHE=0 restores pin-per-call. TCP regMr yields a null handle, so
+  // the cache is naturally inert there.
   struct MrCacheEntry {
     uintptr_t addr = 0;
     size_t len = 0;
@@ -93,8 +94,8 @@ struct vcclComm {
   int mrCacheCap() {
     static int cap = [] {
       const char* e = std::getenv("VCCL_MR_CACHE");
-      if (e == nullptr) return 0;      // DEFAULT OFF (Phase 2: return 16)
-      if (e[0] == '0' && e[1] == '\0') return 0;
+      if (e == nullptr) return 16;     // DEFAULT ON (16). VCCL_MR_CACHE=0 disables.
+      if (e[0] == '0' && e[1] == '\0') return 0;   // explicit kill switch
       int v = atoi(e);
       return v > 0 ? v : 16;           // "1"/non-numeric -> default capacity
     }();
