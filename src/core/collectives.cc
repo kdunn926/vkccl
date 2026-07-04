@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <utility>
 #include <vector>
 
 #include "core/comm.h"
@@ -361,12 +362,39 @@ vcclResult_t recursiveDoublingAllReduce(vcclComm_t comm, char* recv,
   const int n = comm->nranks;
   const int r = comm->rank;
   const size_t bytes = count * vcclTypeSize(dt);
-  char* scratch = comm->scratchAt(bytes);
-  for (int mask = 1; mask < n; mask <<= 1) {
+  // One DISTINCT scratch region per step so all steps' recvs can be live at
+  // once (a pre-posted recv's target must not be overwritten before its
+  // step's wait confirms completion). steps = log2(n): n=4 -> 2*bytes
+  // (20KB), n=8 -> 3*bytes. Trivial vs the persistent scratch budget.
+  int steps = 0;
+  for (int m = 1; m < n; m <<= 1) steps++;
+  char* scratch = comm->scratchAt(static_cast<size_t>(steps) * bytes);
+
+  // M5 pre-post: post every step's recv up front into its own region. FIFO
+  // invariant: postRecvs records a per-PEER deque of WR counts, consumed in
+  // order by the matching sendRecv. Recdouble peers are r^mask for distinct
+  // one-hot masks, hence pairwise DISTINCT -- each peer's FIFO holds exactly
+  // one entry, so consume order is trivially correct. (We also post in step
+  // order, which equals sendRecv issue order, so even a hypothetical repeat
+  // peer would be safe.) Pre-post makes the whole path structurally
+  // RNR-free: all recv WQEs are on the queue before ANY step's send, so no
+  // send can outrun its partner's recv post between steps.
+  {
+    std::vector<vccl::Transport::RecvReq> reqs;
+    int i = 0;
+    for (int mask = 1; mask < n; mask <<= 1, ++i) {
+      const int peer = r ^ mask;
+      reqs.push_back({peer, scratch + static_cast<size_t>(i) * bytes, bytes});
+    }
+    VCCLCHECK(comm->transport->postRecvs(reqs));
+  }
+
+  int i = 0;
+  for (int mask = 1; mask < n; mask <<= 1, ++i) {
     const int peer = r ^ mask;
-    VCCLCHECK(comm->transport->sendRecv(peer, recv, bytes, peer, scratch,
-                                        bytes));
-    VCCLCHECK(vccl::cpuReduce(dt, op, recv, scratch, count));
+    char* rgn = scratch + static_cast<size_t>(i) * bytes;
+    VCCLCHECK(comm->transport->sendRecv(peer, recv, bytes, peer, rgn, bytes));
+    VCCLCHECK(vccl::cpuReduce(dt, op, recv, rgn, count));
   }
   return vcclSuccess;
 }
@@ -379,50 +407,97 @@ vcclResult_t recursiveDoublingAllReduce(vcclComm_t comm, char* recv,
 // holds this rank's (premul-scaled) contribution; `scratch` is full size.
 // All vccl ops are commutative, so the fold order matches the ring result
 // (float sum differs only by reduction order, within test tolerance).
+//
+// Peer-disjointness (why the M5 pre-post FIFO stays clean): p2 = largest
+// power of two <= n, extra = n - p2 (0<extra<p2). Ranks 0..2*extra-1 pair up:
+// even r recvs from r+1 (survives, newRank=r/2); odd r sends to r-1
+// (eliminated, newRank=-1). Ranks >=2*extra: newRank=r-extra, all survive.
+//   - Even survivor peers: pre-step recv from r+1, plus core peers. r+1 is an
+//     eliminated-odd rank -> never an active rank -> never a core peer. Core
+//     peers are newRank^mask-mapped active ranks, pairwise distinct. => all
+//     this rank's peers distinct.
+//   - Odd eliminated peer set: just r-1 (post-step recv; the pre-step is a
+//     *send* to r-1, which doesn't touch the FIFO). One recv FIFO entry.
+//   - Plain survivor (r>=2*extra): core peers only, pairwise distinct.
+// So every peer's recv FIFO holds at most one pre-posted entry across the
+// whole pow2-elim sequence.
 vcclResult_t pow2ElimAllReduce(vcclComm_t comm, char* recv, size_t count,
                                vcclDataType_t dt, vcclRedOp_t op) {
   const int n = comm->nranks;
   const int r = comm->rank;
   const size_t bytes = count * vcclTypeSize(dt);
-  char* scratch = comm->scratchAt(bytes);
 
   int p2 = 1;
   while (p2 * 2 <= n) p2 <<= 1;
-  const int extra = n - p2;  // 0 < extra < p2 for non-power-of-two n
+  const int extra = n - p2;                 // 0 < extra < p2
 
-  // Pre-step: pair the first 2*extra ranks. The odd member sends its data to
-  // the even member (which reduces it in) and drops out until the post-step.
+  // Classify this rank up front (pure arithmetic, no comm) so we can
+  // pre-post.
   int newRank;
-  if (r < 2 * extra) {
-    if (r & 1) {
-      VCCLCHECK(comm->transport->send(r - 1, recv, bytes));
-      newRank = -1;
-    } else {
-      VCCLCHECK(comm->transport->recv(r + 1, scratch, bytes));
-      VCCLCHECK(vccl::cpuReduce(dt, op, recv, scratch, count));
-      newRank = r / 2;
-    }
-  } else {
-    newRank = r - extra;
-  }
+  const bool inPre = r < 2 * extra;
+  const bool evenSurvivor = inPre && !(r & 1);   // recv pre-step, run core
+  const bool oddEliminated = inPre && (r & 1);   // send pre-step, wait post-step
+  if (inPre)      newRank = (r & 1) ? -1 : r / 2;
+  else            newRank = r - extra;
 
-  // Core: recursive doubling over the p2 active ranks (folded ranks skip it).
+  int coreSteps = 0;
+  for (int m = 1; m < p2; m <<= 1) coreSteps++;
+
+  // Scratch layout: region[0] = pre-step recv target (even survivor only);
+  // region[1..coreSteps] = one per core step. Odd-eliminated rank recvs its
+  // post-step result straight into `recv` (already ScopedReg-pinned), not
+  // scratch. Uniform sizing (1+coreSteps) is a few *bytes*; e.g. n=5 ->
+  // 3*bytes.
+  char* scratch = comm->scratchAt(static_cast<size_t>(1 + coreSteps) * bytes);
+  char* preRgn = scratch;                        // region[0]
+
+  // Precompute core peers once (used by both the pre-post and the loop).
+  std::vector<std::pair<int, char*>> corePeers;  // (peer, region)
   if (newRank >= 0) {
-    for (int mask = 1; mask < p2; mask <<= 1) {
+    int i = 0;
+    for (int mask = 1; mask < p2; mask <<= 1, ++i) {
       const int newPeer = newRank ^ mask;
       const int peer = (newPeer < extra) ? newPeer * 2 : newPeer + extra;
-      VCCLCHECK(comm->transport->sendRecv(peer, recv, bytes, peer, scratch,
-                                          bytes));
-      VCCLCHECK(vccl::cpuReduce(dt, op, recv, scratch, count));
+      corePeers.push_back({peer, scratch + static_cast<size_t>(1 + i) * bytes});
     }
   }
 
-  // Post-step: even members send the full result back to their folded partner.
-  if (r < 2 * extra) {
-    if (r & 1)
-      VCCLCHECK(comm->transport->recv(r - 1, recv, bytes));
-    else
-      VCCLCHECK(comm->transport->send(r + 1, recv, bytes));
+  // -- M5 pre-post -----------------------------------------------------------
+  // Pre-post, in issue order, EVERY recv this rank will perform:
+  //   even survivor : pre-step recv(r+1 -> preRgn), then core recvs
+  //   odd eliminated: post-step recv(r-1 -> recv)  [its only recv]
+  //   plain survivor: core recvs
+  // Peer-disjointness (see block comment above) => each peer FIFO holds one
+  // entry; issue order == post order per peer. This makes the pre/post bare
+  // steps AND the core structurally RNR-free -- the specific n=5 target.
+  {
+    std::vector<vccl::Transport::RecvReq> reqs;
+    if (evenSurvivor) reqs.push_back({r + 1, preRgn, bytes});
+    if (oddEliminated) reqs.push_back({r - 1, recv, bytes});  // post-step target
+    for (auto& cp : corePeers) reqs.push_back({cp.first, cp.second, bytes});
+    VCCLCHECK(comm->transport->postRecvs(reqs));
+  }
+
+  // -- Pre-step ---------------------------------------------------------------
+  if (evenSurvivor) {
+    VCCLCHECK(comm->transport->recv(r + 1, preRgn, bytes));   // consumes FIFO[r+1]
+    VCCLCHECK(vccl::cpuReduce(dt, op, recv, preRgn, count));
+  } else if (oddEliminated) {
+    VCCLCHECK(comm->transport->send(r - 1, recv, bytes));     // send: no FIFO
+  }
+
+  // -- Core: recursive doubling over the p2 active ranks -----------------------
+  for (auto& cp : corePeers) {
+    VCCLCHECK(comm->transport->sendRecv(cp.first, recv, bytes,
+                                        cp.first, cp.second, bytes));  // consumes FIFO
+    VCCLCHECK(vccl::cpuReduce(dt, op, recv, cp.second, count));
+  }
+
+  // -- Post-step: even survivor scatters the result back to its folded partner -
+  if (evenSurvivor) {
+    VCCLCHECK(comm->transport->send(r + 1, recv, bytes));     // send: no FIFO
+  } else if (oddEliminated) {
+    VCCLCHECK(comm->transport->recv(r - 1, recv, bytes));     // consumes FIFO[r-1]
   }
   return vcclSuccess;
 }
