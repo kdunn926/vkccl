@@ -402,7 +402,16 @@ class VerbsTransport final : public Transport {
     if (bytes == 0) return vcclSuccess;
     DrainGuard guard{this};
     int wrs = 0;
-    VCCLCHECK(postRecv(peer, buf, bytes, &wrs));
+    // M5: consume a pre-posted recv for this peer if one exists (symmetric to
+    // sendRecv). Order matches: recvs are pre-posted in the order the
+    // collective issues its recv()/sendRecv recvs. Empty FIFO -> post now
+    // (TCP + all non-pre-posting callers unchanged).
+    if (!prePostedRecv_[peer].empty()) {
+      wrs = prePostedRecv_[peer].front();
+      prePostedRecv_[peer].pop_front();
+    } else {
+      VCCLCHECK(postRecv(peer, buf, bytes, &wrs));
+    }
     VCCLCHECK(pollPeer(peer, 0, wrs));
     drainCompleted();
     guard.committed = true;
@@ -787,6 +796,12 @@ class VerbsTransport final : public Transport {
     pendingCopyback_.clear();
     for (ibv_mr* mr : tempMrs_) ibv_dereg_mr(mr);
     tempMrs_.clear();
+    // M5: a mid-collective abort leaves stale pre-posted recv FIFO entries
+    // for peers whose collective step never ran. The comm is marked aborted
+    // and never reused (checkComm rejects further ops), so this is latent,
+    // not active -- but clear it defensively so a future reuse path can't
+    // consume a stale entry.
+    for (auto& q : prePostedRecv_) q.clear();
   }
   struct DrainGuard {
     VerbsTransport* t;
