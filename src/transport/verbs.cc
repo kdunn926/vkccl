@@ -264,6 +264,7 @@ class VerbsTransport final : public Transport {
     t->qps_.assign(nranks, nullptr);
     t->maxInline_.assign(nranks, 0);
     t->prePostedRecv_.assign(nranks, {});
+    t->recvSurplus_.assign(nranks, 0);
 
     std::mt19937 rng(std::random_device{}());
     std::vector<QpInfo> local(nranks);
@@ -447,13 +448,17 @@ class VerbsTransport final : public Transport {
         if (pf.steps >= 256) { profDump(rank_); fflush(stdout); }
       }
     } else {
-      // Poll both CQs; either side may finish first.
+      // Poll both CQs; either side may finish first. Draw down any recv
+      // completions an earlier step already reaped from this peer (pre-posted
+      // multi-recv), and credit back anything this poll reaps beyond what the
+      // step needs so a later step can consume it.
+      int recvNeed = takeRecvSurplus(recvPeer, recvWrs);
       Deadline deadline;
       int sendDone = 0, recvDone = 0;
-      while (sendDone < sendWrs || recvDone < recvWrs) {
+      while (sendDone < sendWrs || recvDone < recvNeed) {
         if (sendDone < sendWrs)
           VCCLCHECK(pollOnce(sendPeer, &sendDone, nullptr));
-        if (recvDone < recvWrs)
+        if (recvDone < recvNeed)
           VCCLCHECK(pollOnce(recvPeer, nullptr, &recvDone));
         if (drainAsyncFatal()) return vcclRemoteError;
         if (deadline.expired()) {
@@ -461,6 +466,7 @@ class VerbsTransport final : public Transport {
           return vcclSystemError;
         }
       }
+      if (recvDone > recvNeed) recvSurplus_[recvPeer] += recvDone - recvNeed;
     }
     drainCompleted();
     guard.committed = true;
@@ -802,12 +808,21 @@ class VerbsTransport final : public Transport {
     // not active -- but clear it defensively so a future reuse path can't
     // consume a stale entry.
     for (auto& q : prePostedRecv_) q.clear();
+    for (int& s : recvSurplus_) s = 0;
   }
   struct DrainGuard {
     VerbsTransport* t;
     bool committed = false;
     ~DrainGuard() { if (!committed) t->discardPending(); }
   };
+
+  // Consume up to `want` already-reaped recv completions credited to `peer`
+  // by a prior over-reaping poll; return how many still need to be waited for.
+  int takeRecvSurplus(int peer, int want) {
+    int use = std::min(want, recvSurplus_[peer]);
+    recvSurplus_[peer] -= use;
+    return want - use;
+  }
 
   vcclResult_t pollOnce(int peer, int* sendDone, int* recvDone) {
     ibv_wc wc[16];
@@ -836,8 +851,12 @@ class VerbsTransport final : public Transport {
     Prof& pf = prof();
     double tstart = pf.on ? Prof::now_us() : 0;
     bool sawFirst = false;
+    // Same recv-surplus accounting as the split-CQ sendRecv branch: this peer's
+    // send and recv completions share one CQ, so a single poll can still reap a
+    // later pre-posted recv beyond recvWrs — credit it rather than lose it.
+    int recvNeed = takeRecvSurplus(peer, recvWrs);
     int sendDone = 0, recvDone = 0;
-    while (sendDone < sendWrs || recvDone < recvWrs) {
+    while (sendDone < sendWrs || recvDone < recvNeed) {
       int before = sendDone + recvDone;
       VCCLCHECK(pollOnce(peer, &sendDone, &recvDone));
       if (pf.on) {
@@ -861,6 +880,7 @@ class VerbsTransport final : public Transport {
         return vcclSystemError;
       }
     }
+    if (recvDone > recvNeed) recvSurplus_[peer] += recvDone - recvNeed;
     return vcclSuccess;
   }
 
@@ -890,6 +910,14 @@ class VerbsTransport final : public Transport {
   std::vector<ibv_qp*> qps_;
   std::vector<uint32_t> maxInline_;
   std::vector<std::deque<int>> prePostedRecv_;  // sized nranks; per-peer recv WR counts
+  // Per-peer recv completions reaped by a poll beyond what its step needed.
+  // A single ibv_poll_cq drains up to 16 WCs, so when several recvs are
+  // pre-posted on ONE peer (ring all-gather/all-reduce pre-post n-1 recvs from
+  // prev()), an early step's poll can reap LATER steps' recv completions too.
+  // Crediting the overshoot here — and drawing it down before the next wait on
+  // that peer — keeps those completions from being lost (which stranded the
+  // later step's wait until VCCL_TIMEOUT). Sized nranks.
+  std::vector<int> recvSurplus_;
   std::atomic<bool> asyncFatal_{false};
   // Persistent registrations (vcclCommRegister / dmabuf imports). std::list:
   // Region addresses are handed out as handles and must stay stable.
